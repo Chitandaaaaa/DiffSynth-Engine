@@ -3,6 +3,19 @@
 import importlib
 
 
+def is_npu_available():
+    """Detect if NPU is available."""
+    if importlib.util.find_spec("torch_npu") is None:
+        return False
+    try:
+        import torch_npu
+
+        _ = torch.npu.device_count()
+        return torch.npu.is_available()
+    except RuntimeError:
+        return False
+
+
 class LazyImport:
     def __init__(self, module_name: str, class_name: str):
         self.module_name = module_name
