@@ -22,16 +22,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 from diffusers.configuration_utils import register_to_config
-from diffusers.models.attention import FeedForward
+from diffsynth_engine.layers.mlp import FastGELUMLP
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
+from diffusers.models.normalization import AdaLayerNormContinuous
+from diffsynth_engine.layers.norm import RMSNorm
 
 from diffsynth_engine.distributed.utils import sequence_parallel_shard, sequence_parallel_unshard
 from diffsynth_engine.forward_context import get_forward_context
 from diffsynth_engine.layers.attention import USPAttention
 from diffsynth_engine.models.base import DiffusionModel
 from diffsynth_engine.utils import logging
+from diffsynth_engine.utils.import_utils import is_npu_available
 
 logger = logging.get_logger(__name__)
 
@@ -58,28 +60,66 @@ def apply_rotary_emb_qwen(
     """
     if use_real:
         cos, sin = freqs_cis  # [S, D]
-        cos = cos[None, None]
-        sin = sin[None, None]
+        # Broadcast to [1, S, 1, D] to match x: [B, S, H, D]
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
         cos, sin = cos.to(x.device), sin.to(x.device)
 
+        # rotated_mode mapping
         if use_real_unbind_dim == -1:
-            # Used for flux, cogvideox, hunyuan-dit
-            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)  # [B, S, H, D//2]
-            x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+            rotated_mode = "rotated_half"
         elif use_real_unbind_dim == -2:
-            # Used for Stable Audio, OmniGen, CogView4 and Cosmos
-            x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(-2)  # [B, S, H, D//2]
-            x_rotated = torch.cat([-x_imag, x_real], dim=-1)
+            rotated_mode = "rotated_interleaved"
         else:
-            raise ValueError(f"`use_real_unbind_dim={use_real_unbind_dim}` but should be -1 or -2.")
+            raise ValueError(f"use_real_unbind_dim must be -1 or -2, got {use_real_unbind_dim}")
 
-        out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+        if is_npu_available():
+            from mindiesd.layers.rope import rotary_position_embedding
 
-        return out
+            x_out = rotary_position_embedding(
+                x=x,
+                cos=cos,
+                sin=sin,
+                rotated_mode=rotated_mode,
+                head_first=False,
+                fused=True,
+            )
+        else:
+            # Fallback to original implementation
+            if use_real_unbind_dim == -1:
+                x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
+                x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+            else:
+                x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(-2)
+                x_rotated = torch.cat([-x_imag, x_real], dim=-1)
+            x_out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+
+        return x_out
     else:
-        x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        freqs_cis = freqs_cis.unsqueeze(1)
-        x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
+        # Complex path: freqs_cis is [S, D] complex
+        freqs_real = torch.view_as_real(freqs_cis)  # [S, D, 2]
+        cos = freqs_real[..., 0]  # [S, D]
+        sin = freqs_real[..., 1]  # [S, D]
+        # Broadcast to [1, S, 1, D]
+        cos_bc = cos[None, :, None, :]
+        sin_bc = sin[None, :, None, :]
+
+        if is_npu_available():
+            from mindiesd.layers.rope import rotary_position_embedding
+
+            x_out = rotary_position_embedding(
+                x=x,
+                cos=cos_bc,
+                sin=sin_bc,
+                rotated_mode="rotated_half",
+                head_first=False,
+                fused=True,
+            )
+        else:
+            # Fallback to original implementation
+            x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+            freqs_cis = freqs_cis.unsqueeze(1)
+            x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
 
         return x_out.type_as(x)
 
@@ -553,7 +593,7 @@ class QwenImageTransformerBlock(nn.Module):
             eps=eps,
         )
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.img_mlp = FastGELUMLP(dim=dim, dim_out=dim)
 
         # Text processing modules
         self.txt_mod = nn.Sequential(
@@ -563,7 +603,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.txt_mlp = FastGELUMLP(dim=dim, dim_out=dim)
 
         self.zero_cond_t = zero_cond_t
 
