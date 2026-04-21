@@ -46,8 +46,14 @@ class TestFastGELUMLPFallback:
         dim = 64
         mlp = FastGELUMLP(dim=dim, dim_out=dim)
         ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
-        x = torch.randn(2, 16, dim)
 
+        # Copy weights from ff to mlp to verify equivalence with same weights
+        mlp.net[0].weight.data = ff.net[0].proj.weight.data.clone()
+        mlp.net[0].bias.data = ff.net[0].proj.bias.data.clone()
+        mlp.net[2].weight.data = ff.net[2].weight.data.clone()
+        mlp.net[2].bias.data = ff.net[2].bias.data.clone()
+
+        x = torch.randn(2, 16, dim)
         out_ours = mlp(x)
         out_ref = ff(x)
 
@@ -67,4 +73,4 @@ class TestFastGELUMLPBasics:
     def test_dim_out_default(self):
         """Verify dim_out defaults to dim."""
         mlp = FastGELUMLP(dim=64)
-        assert mlp.net[1].out_features == 64
+        assert mlp.net[2].out_features == 64

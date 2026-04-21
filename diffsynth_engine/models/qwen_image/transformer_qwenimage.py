@@ -117,9 +117,9 @@ def apply_rotary_emb_qwen(
             )
         else:
             # Fallback to original implementation
-            x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-            freqs_cis = freqs_cis.unsqueeze(1)
-            x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
+            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
+            x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+            x_out = (x.float() * cos_bc + x_rotated.float() * sin_bc).to(x.dtype)
 
         return x_out.type_as(x)
 

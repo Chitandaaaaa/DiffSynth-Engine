@@ -28,7 +28,13 @@ class FastGELUMLP(nn.Module):
         inner_dim = int(dim * mult)
         dim_out = dim_out or dim
 
-        self.net = nn.ModuleList([nn.Linear(dim, inner_dim), nn.Linear(inner_dim, dim_out)])
+        # Match diffusers FeedForward structure: net[0]=Linear, net[2]=output
+        # net[1] is Dropout which is skipped in inference
+        self.net = nn.ModuleList([
+            nn.Linear(dim, inner_dim),
+            nn.Dropout(0.0),
+            nn.Linear(inner_dim, dim_out),
+        ])
 
     def forward(self, hidden_states):
         """Forward pass.
@@ -39,6 +45,7 @@ class FastGELUMLP(nn.Module):
         Returns:
             Output tensor, shape [B, S, dim_out]
         """
+        # net[0] = Linear (dim → inner_dim)
         hidden_states = self.net[0](hidden_states)
 
         if is_npu_available() and torch_npu is not None:
@@ -46,5 +53,6 @@ class FastGELUMLP(nn.Module):
         else:
             hidden_states = F.gelu(hidden_states, approximate="tanh")
 
-        hidden_states = self.net[1](hidden_states)
+        # net[2] = output Linear (inner_dim → dim_out)
+        hidden_states = self.net[2](hidden_states)
         return hidden_states
