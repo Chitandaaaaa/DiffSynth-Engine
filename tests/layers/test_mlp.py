@@ -1,19 +1,26 @@
 import torch
 import pytest
 from diffsynth_engine.layers.mlp import FastGELUMLP
+from diffsynth_engine.utils.import_utils import is_npu_available
 
 
 class TestFastGELUMLP:
     def test_fastgelu_output_shape(self):
-        """Verify FastGELUMLP output shape is correct."""
+        """Verify FastGELUMLP output shape is correct on NPU."""
+        if not is_npu_available():
+            pytest.skip("NPU not available")
+
         mlp = FastGELUMLP(dim=64, dim_out=64)
-        x = torch.randn(2, 16, 64)
+        x = torch.randn(2, 16, 64).npu()
         out = mlp(x)
         assert out.shape == (2, 16, 64)
         assert not torch.isnan(out).any()
 
     def test_fastgelu_equivalence(self):
         """Verify output is equivalent to FeedForward when NPU not available."""
+        if is_npu_available():
+            pytest.skip("NPU available, test requires CPU fallback path")
+
         from diffusers.models.attention import FeedForward
 
         dim = 64
