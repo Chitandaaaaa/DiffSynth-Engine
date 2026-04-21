@@ -1,6 +1,7 @@
 # Copied from https://github.com/sgl-project/sglang
 
 import importlib
+import torch
 
 
 def is_npu_available():

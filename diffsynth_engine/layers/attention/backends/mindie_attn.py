@@ -58,6 +58,7 @@ class MindieAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
         attn_metadata=None,
     ) -> torch.Tensor:
         from mindiesd.layers.flash_attn.attention_forward import attention_forward
@@ -70,7 +71,7 @@ class MindieAttentionImpl(AttentionImpl):
             query=query,
             key=key,
             value=value,
-            attn_mask=None,
+            attn_mask=attn_mask,
             scale=scale,
             fused=True,
             head_first=False,

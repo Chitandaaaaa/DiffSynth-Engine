@@ -1,7 +1,7 @@
 from functools import cache
 
 from diffsynth_engine.layers.attention.backends.abstract import AttentionBackend, AttentionType
-from diffsynth_engine.utils.import_utils import LazyImport
+from diffsynth_engine.utils.import_utils import LazyImport, is_npu_available
 
 AiterBackend = LazyImport("diffsynth_engine.layers.attention.backends.aiter", "AiterBackend")
 AiterFP8Backend = LazyImport("diffsynth_engine.layers.attention.backends.aiter", "AiterFP8Backend")
@@ -34,8 +34,6 @@ _attention_backends = {
 
 @cache
 def get_attn_backend(head_size: int, attn_type: AttentionType | None = None) -> type["AttentionBackend"]:
-    from diffsynth_engine.utils.import_utils import is_npu_available
-
     # use SDPA as default
     if attn_type is None:
         attn_type = AttentionType.SDPA
