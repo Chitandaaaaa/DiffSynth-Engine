@@ -48,8 +48,8 @@ class TestFastGELUMLPFallback:
         ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
         # Copy weights from ff to mlp to verify equivalence with same weights
-        mlp.net[0].weight.data = ff.net[0].proj.weight.data.clone()
-        mlp.net[0].bias.data = ff.net[0].proj.bias.data.clone()
+        mlp.net[0].proj.weight.data = ff.net[0].proj.weight.data.clone()
+        mlp.net[0].proj.bias.data = ff.net[0].proj.bias.data.clone()
         mlp.net[2].weight.data = ff.net[2].weight.data.clone()
         mlp.net[2].bias.data = ff.net[2].bias.data.clone()
 
@@ -67,8 +67,8 @@ class TestFastGELUMLPBasics:
         """Verify mult parameter creates correct inner dimension."""
         mlp_4 = FastGELUMLP(dim=64, mult=4)
         mlp_2 = FastGELUMLP(dim=64, mult=2)
-        assert mlp_4.net[0].out_features == 256
-        assert mlp_2.net[0].out_features == 128
+        assert mlp_4.net[0].proj.out_features == 256
+        assert mlp_2.net[0].proj.out_features == 128
 
     def test_dim_out_default(self):
         """Verify dim_out defaults to dim."""
