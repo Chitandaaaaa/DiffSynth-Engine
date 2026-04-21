@@ -96,30 +96,12 @@ def apply_rotary_emb_qwen(
 
         return x_out
     else:
-        # Complex path: freqs_cis is [S, D] complex
-        freqs_real = torch.view_as_real(freqs_cis)  # [S, D, 2]
-        cos = freqs_real[..., 0]  # [S, D]
-        sin = freqs_real[..., 1]  # [S, D]
-        # Broadcast to [1, S, 1, D]
-        cos_bc = cos[None, :, None, :]
-        sin_bc = sin[None, :, None, :]
-
-        if is_npu_available():
-            from mindiesd.layers.rope import rotary_position_embedding
-
-            x_out = rotary_position_embedding(
-                x=x,
-                cos=cos_bc,
-                sin=sin_bc,
-                rotated_mode="rotated_half",
-                head_first=False,
-                fused=True,
-            )
-        else:
-            # Fallback to original implementation
-            x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
-            x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
-            x_out = (x.float() * cos_bc + x_rotated.float() * sin_bc).to(x.dtype)
+        # Complex path: freqs_cis is [S, D//2] complex
+        # x is [B, S, H, D] where D = 2 * freq_dim
+        # Use original complex multiplication approach
+        x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+        freqs_cis = freqs_cis.unsqueeze(1)
+        x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
 
         return x_out.type_as(x)
 
