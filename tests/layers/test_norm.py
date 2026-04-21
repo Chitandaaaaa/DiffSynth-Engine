@@ -37,19 +37,22 @@ class TestRMSNormFallback:
     """Test fallback path when NPU not available."""
 
     @patch("diffsynth_engine.layers.norm.is_npu_available", return_value=False)
+    @patch("diffsynth_engine.layers.norm.torch_npu", None)
     def test_rmsnorm_uses_diffusers_when_npu_unavailable(self, mock_is_npu):
         """Verify diffusers implementation is used when NPU unavailable."""
-        from diffusers.models.normalization import RMSNorm as DiffusersRMSNorm
+        # Mock diffusers internal torch_npu to prevent it from using NPU
+        with patch("diffusers.models.normalization.torch_npu", None):
+            from diffusers.models.normalization import RMSNorm as DiffusersRMSNorm
 
-        hidden_size, eps = 64, 1e-6
-        norm = RMSNorm(hidden_size, eps)
-        ref_norm = DiffusersRMSNorm(hidden_size, eps)
-        x = torch.randn(2, 16, 64)
+            hidden_size, eps = 64, 1e-6
+            norm = RMSNorm(hidden_size, eps)
+            ref_norm = DiffusersRMSNorm(hidden_size, eps)
+            x = torch.randn(2, 16, 64)
 
-        out_ours = norm(x)
-        out_ref = ref_norm(x)
+            out_ours = norm(x)
+            out_ref = ref_norm(x)
 
-        assert torch.allclose(out_ours, out_ref, atol=1e-5)
+            assert torch.allclose(out_ours, out_ref, atol=1e-5)
 
     def test_rmsnorm_weight_property(self):
         """Verify weight property is accessible."""
