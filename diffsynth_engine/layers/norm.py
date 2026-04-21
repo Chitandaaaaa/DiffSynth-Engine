@@ -16,15 +16,12 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.eps = eps
-        self.diffusers_norm = DiffusersRMSNorm(hidden_size, eps)
+        diffusers_norm = DiffusersRMSNorm(hidden_size, eps)
+        # Use same weight as diffusers RMSNorm to match checkpoint keys
+        self.register_parameter("weight", diffusers_norm.weight)
 
     def forward(self, hidden_states):
         if is_npu_available() and torch_npu is not None:
             return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.eps)[0]
         else:
-            return self.diffusers_norm(hidden_states)
-
-    @property
-    def weight(self):
-        """透传到 diffusers 的 weight 参数，供 npu_rms_norm 使用。"""
-        return self.diffusers_norm.weight
+            return DiffusersRMSNorm(self.hidden_size, self.eps)(hidden_states)
