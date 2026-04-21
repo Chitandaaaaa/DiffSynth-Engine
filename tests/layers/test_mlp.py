@@ -63,10 +63,10 @@ class TestFastGELUMLPBasics:
         """Verify mult parameter creates correct inner dimension."""
         mlp_4 = FastGELUMLP(dim=64, mult=4)
         mlp_2 = FastGELUMLP(dim=64, mult=2)
-        assert mlp_4.proj_in.out_features == 256
-        assert mlp_2.proj_in.out_features == 128
+        assert mlp_4.net[0].out_features == 256
+        assert mlp_2.net[0].out_features == 128
 
     def test_dim_out_default(self):
         """Verify dim_out defaults to dim."""
         mlp = FastGELUMLP(dim=64)
-        assert mlp.proj_out.out_features == 64
+        assert mlp.net[1].out_features == 64

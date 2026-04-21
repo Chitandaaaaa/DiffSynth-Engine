@@ -2,6 +2,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffsynth_engine.utils.import_utils import is_npu_available
 
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
 
 class FastGELUMLP(nn.Module):
     """MLP with npu_fast_gelu on NPU, fallback to F.gelu on other devices.
@@ -23,8 +28,7 @@ class FastGELUMLP(nn.Module):
         inner_dim = int(dim * mult)
         dim_out = dim_out or dim
 
-        self.proj_in = nn.Linear(dim, inner_dim)
-        self.proj_out = nn.Linear(inner_dim, dim_out)
+        self.net = nn.ModuleList([nn.Linear(dim, inner_dim), nn.Linear(inner_dim, dim_out)])
 
     def forward(self, hidden_states):
         """Forward pass.
@@ -35,14 +39,12 @@ class FastGELUMLP(nn.Module):
         Returns:
             Output tensor, shape [B, S, dim_out]
         """
-        hidden_states = self.proj_in(hidden_states)
+        hidden_states = self.net[0](hidden_states)
 
-        if is_npu_available():
-            import torch_npu
-
+        if is_npu_available() and torch_npu is not None:
             hidden_states = torch_npu.npu_fast_gelu(hidden_states)
         else:
             hidden_states = F.gelu(hidden_states, approximate="tanh")
 
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states = self.net[1](hidden_states)
         return hidden_states
