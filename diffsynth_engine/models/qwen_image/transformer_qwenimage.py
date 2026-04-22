@@ -98,10 +98,37 @@ def apply_rotary_emb_qwen(
     else:
         # Complex path: freqs_cis is [S, D//2] complex
         # x is [B, S, H, D] where D = 2 * freq_dim
-        # Use original complex multiplication approach
-        x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        freqs_cis = freqs_cis.unsqueeze(1)
-        x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
+        freqs_real = torch.view_as_real(freqs_cis)  # [S, D//2, 2]
+        cos = freqs_real[..., 0]  # [S, D//2]
+        sin = freqs_real[..., 1]  # [S, D//2]
+
+        if is_npu_available():
+            from mindiesd.layers.rope import rotary_position_embedding
+
+            # Pad to full dimension D: [S, D//2] -> [S, D]
+            D = x.shape[-1]
+            S = cos.shape[0]
+            cos_full = torch.zeros(S, D, device=x.device, dtype=cos.dtype)
+            sin_full = torch.zeros(S, D, device=x.device, dtype=sin.dtype)
+            cos_full[..., : D // 2] = cos
+            sin_full[..., : D // 2] = sin
+
+            # Broadcast to [1, S, 1, D] to match x: [B, S, H, D]
+            cos_bc = cos_full[None, :, None, :]
+            sin_bc = sin_full[None, :, None, :]
+
+            x_out = rotary_position_embedding(
+                x=x,
+                cos=cos_bc,
+                sin=sin_bc,
+                rotated_mode="rotated_half",
+                head_first=False,
+                fused=True,
+            )
+        else:
+            # Fallback: original complex multiplication
+            x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+            x_out = torch.view_as_real(x_rotated * freqs_cis.unsqueeze(1)).flatten(3)
 
         return x_out.type_as(x)
 

@@ -23,22 +23,25 @@ class TestRoPENPU:
         sys.modules["mindiesd.layers.rope"] = mock_rope
         return mock_rotary_fn
 
-    def test_rope_use_real_false_no_npu_due_to_dim_mismatch(self):
-        """Verify use_real=False uses fallback even when NPU available.
+    def test_rope_use_real_false_calls_npu(self):
+        """Verify rotary_position_embedding is called for use_real=False with dimension padding.
 
-        The use_real=False path cannot use rotary_position_embedding because
-        x has dim=128 but cos/sin have dim=64 (incompatible for NPU op).
-        The fallback formula is used instead.
+        The use_real=False path converts freqs_cis [S, D//2] to cos/sin [S, D//2],
+        then pads to full dimension [S, D] before calling NPU op.
         """
         mock_rotary = self._setup_mindiesd_mock()
+        mock_rotary.side_effect = lambda x, **kwargs: x  # Return x unchanged
 
         with patch("diffsynth_engine.models.qwen_image.transformer_qwenimage.is_npu_available", return_value=True):
             x = torch.randn(2, 16, 8, 128)
             freqs_cis = torch.randn(16, 64, dtype=torch.complex64)
             out = apply_rotary_emb_qwen(x, freqs_cis, use_real=False)
 
-            # rotary_position_embedding should NOT be called due to dim mismatch
-            mock_rotary.assert_not_called()
+            # rotary_position_embedding should be called once
+            mock_rotary.assert_called_once()
+            # Verify rotated_mode is rotated_half
+            call_kwargs = mock_rotary.call_args.kwargs
+            assert call_kwargs.get("rotated_mode") == "rotated_half"
             assert out.shape == x.shape
 
     def test_rope_use_real_true_calls_npu(self):
