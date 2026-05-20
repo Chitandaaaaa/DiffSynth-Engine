@@ -17,13 +17,15 @@ def _parse_tuple(value: str) -> Tuple[int, int] | int:
         raise ValueError(f"Cannot parse tuple: {value}, format should be '256,256' or '256'")
 
 
-def _parse_attention_type(attn_type_str: str) -> AttentionType:
-    """Convert string to AttentionType enum"""
+def _parse_attention_type(attn_type_str: str | None) -> AttentionType | None:
+    """Convert string to AttentionType enum. Returns None for auto-detect."""
+    if attn_type_str is None:
+        return None
     return AttentionType[attn_type_str.upper()]
 
 
 def _parse_attention_params(
-    attn_type: AttentionType,
+    attn_type: AttentionType | None,
     sparge_topk: float | None = None,
 ) -> AttentionParams | None:
     """Parse attention parameters based on attention type"""
@@ -106,9 +108,9 @@ def parse_cli_args() -> Dict[str, Any]:
     attn_group.add_argument(
         "--attn-type",
         type=str,
-        default="sdpa",
+        default=None,
         choices=attn_type_choices,
-        help="Attention type (default: sdpa)",
+        help="Attention type (default: auto, SDPA on GPU, MINDIE on NPU)",
     )
     attn_group.add_argument(
         "--sparge-topk",

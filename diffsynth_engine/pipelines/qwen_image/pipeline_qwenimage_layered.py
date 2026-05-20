@@ -295,6 +295,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                     device=pipeline_config.device,
                     dtype=pipeline_config.model_dtype,
                 )
+                from diffsynth_engine.backends import maybe_compile
+
+                model = maybe_compile(model)
         return model
 
     @staticmethod
