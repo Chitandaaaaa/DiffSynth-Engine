@@ -295,9 +295,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                     device=pipeline_config.device,
                     dtype=pipeline_config.model_dtype,
                 )
-                from diffsynth_engine.platform.npu import apply_mindie_sd_compile
-
-                model = apply_mindie_sd_compile(model)
         return model
 
     @staticmethod
