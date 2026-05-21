@@ -29,7 +29,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
 
 from diffsynth_engine.distributed.utils import sequence_parallel_shard, sequence_parallel_unshard
 from diffsynth_engine.forward_context import get_forward_context
-from diffsynth_engine.layers.adalayernorm import AdaLayerNorm
+
 from diffsynth_engine.layers.attention import USPAttention
 from diffsynth_engine.models.base import DiffusionModel
 from diffsynth_engine.utils import logging
@@ -545,7 +545,7 @@ class QwenImageTransformerBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, 6 * dim, bias=True),  # For scale, shift, gate for norm1 and norm2
         )
-        self.img_norm1 = AdaLayerNorm(nn.LayerNorm(dim, elementwise_affine=False, eps=eps))
+        self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = QwenDoubleStreamAttention(
             dim=dim,
             num_attention_heads=num_attention_heads,
@@ -553,7 +553,7 @@ class QwenImageTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             eps=eps,
         )
-        self.img_norm2 = AdaLayerNorm(nn.LayerNorm(dim, elementwise_affine=False, eps=eps))
+        self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.img_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
         # Text processing modules
@@ -561,41 +561,48 @@ class QwenImageTransformerBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, 6 * dim, bias=True),  # For scale, shift, gate for norm1 and norm2
         )
-        self.txt_norm1 = AdaLayerNorm(nn.LayerNorm(dim, elementwise_affine=False, eps=eps))
+        self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
-        self.txt_norm2 = AdaLayerNorm(nn.LayerNorm(dim, elementwise_affine=False, eps=eps))
+        self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
         self.zero_cond_t = zero_cond_t
 
-    @staticmethod
-    def _split_mod_params(mod_params, index=None):
-        """Extract scale, shift, gate from modulation parameters.
-
-        Args:
-            mod_params: [B, 3*H] modulation parameters
-            index: Optional CFG index for per-position modulation
-
-        Returns:
-            scale: [B, H] or [B, L, H] (with index)
-            shift: [B, H] or [B, L, H] (with index)
-            gate: [B, H] or [B, L, H] (with index)
-        """
-        shift, scale, gate = mod_params.chunk(3, dim=-1)  # each [B, H]
+    def _modulate(self, x, mod_params, index=None):
+        """Apply modulation to input tensor"""
+        # x: b l d, shift: b d, scale: b d, gate: b d
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
 
         if index is not None:
+            # Assuming mod_params batch dim is 2*actual_batch (chunked into 2 parts)
+            # So shift, scale, gate have shape [2*actual_batch, d]
             actual_batch = shift.size(0) // 2
-            shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]
+            shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]  # each: [actual_batch, d]
             scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
             gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
 
-            index_expanded = index.unsqueeze(-1)  # [B, L, 1]
-            scale_out = torch.where(index_expanded == 0, scale_0.unsqueeze(1), scale_1.unsqueeze(1))
-            shift_out = torch.where(index_expanded == 0, shift_0.unsqueeze(1), shift_1.unsqueeze(1))
-            gate_out = torch.where(index_expanded == 0, gate_0.unsqueeze(1), gate_1.unsqueeze(1))
-            return scale_out, shift_out, gate_out
+            # index: [b, l] where b is actual batch size
+            # Expand to [b, l, 1] to match feature dimension
+            index_expanded = index.unsqueeze(-1)  # [b, l, 1]
+
+            # Expand chunks to [b, 1, d] then broadcast to [b, l, d]
+            shift_0_exp = shift_0.unsqueeze(1)  # [b, 1, d]
+            shift_1_exp = shift_1.unsqueeze(1)  # [b, 1, d]
+            scale_0_exp = scale_0.unsqueeze(1)
+            scale_1_exp = scale_1.unsqueeze(1)
+            gate_0_exp = gate_0.unsqueeze(1)
+            gate_1_exp = gate_1.unsqueeze(1)
+
+            # Use torch.where to select based on index
+            shift_result = torch.where(index_expanded == 0, shift_0_exp, shift_1_exp)
+            scale_result = torch.where(index_expanded == 0, scale_0_exp, scale_1_exp)
+            gate_result = torch.where(index_expanded == 0, gate_0_exp, gate_1_exp)
         else:
-            return scale, shift, gate
+            shift_result = shift.unsqueeze(1)
+            scale_result = scale.unsqueeze(1)
+            gate_result = gate.unsqueeze(1)
+
+        return x * (1 + scale_result) + shift_result, gate_result
 
     def forward(
         self,
@@ -619,16 +626,12 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_scale1, img_shift1, img_gate1 = self._split_mod_params(img_mod1, modulate_index)
-        if modulate_index is not None:
-            # Per-position modulation: fallback to raw layernorm + manual modulate
-            img_modulated = self.img_norm1.layernorm(hidden_states) * (1 + img_scale1) + img_shift1
-        else:
-            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
+        img_normed = self.img_norm1(hidden_states)
+        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1, modulate_index)
 
         # Process text stream - norm1 + modulation
-        txt_scale1, txt_shift1, txt_gate1 = self._split_mod_params(txt_mod1)
-        txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
+        txt_normed = self.txt_norm1(encoder_hidden_states)
+        txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
 
         # Use QwenDoubleStreamAttention for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
@@ -651,17 +654,14 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_scale2, img_shift2, img_gate2 = self._split_mod_params(img_mod2, modulate_index)
-        if modulate_index is not None:
-            img_modulated2 = self.img_norm2.layernorm(hidden_states) * (1 + img_scale2) + img_shift2
-        else:
-            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        img_normed2 = self.img_norm2(hidden_states)
+        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2, modulate_index)
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
         # Process text stream - norm2 + MLP
-        txt_scale2, txt_shift2, txt_gate2 = self._split_mod_params(txt_mod2)
-        txt_modulated2 = self.txt_norm2(encoder_hidden_states, txt_scale2, txt_shift2)
+        txt_normed2 = self.txt_norm2(encoder_hidden_states)
+        txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
 

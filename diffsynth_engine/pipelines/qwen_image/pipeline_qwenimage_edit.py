@@ -272,9 +272,9 @@ class QwenImageEditPipeline(Pipeline):
                     device=pipeline_config.device,
                     dtype=pipeline_config.model_dtype,
                 )
-                from diffsynth_engine.backends import maybe_compile
+                from diffsynth_engine.platform.npu import apply_mindie_sd_compile
 
-                model = maybe_compile(model)
+                model = apply_mindie_sd_compile(model)
         return model
 
     @staticmethod
