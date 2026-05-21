@@ -29,7 +29,6 @@ from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
 
 from diffsynth_engine.distributed.utils import sequence_parallel_shard, sequence_parallel_unshard
 from diffsynth_engine.forward_context import get_forward_context
-
 from diffsynth_engine.layers.attention import USPAttention
 from diffsynth_engine.models.base import DiffusionModel
 from diffsynth_engine.utils import logging
@@ -59,8 +58,8 @@ def apply_rotary_emb_qwen(
     """
     if use_real:
         cos, sin = freqs_cis  # [S, D]
-        cos = cos[None, :, None, :]  # [S, D] → [1, S, 1, D]
-        sin = sin[None, :, None, :]
+        cos = cos[None, None]
+        sin = sin[None, None]
         cos, sin = cos.to(x.device), sin.to(x.device)
 
         if use_real_unbind_dim == -1:
