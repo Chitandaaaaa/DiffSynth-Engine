@@ -13,7 +13,7 @@ def _is_mps() -> bool:
     return torch.backends.mps.is_available()
 
 
-def _is_npu() -> bool:
+def is_npu_available() -> bool:
     try:
         import torch_npu
 
@@ -26,13 +26,13 @@ def is_mindie_sd_available() -> bool:
     try:
         import mindiesd  # noqa: F401
 
-        return _is_npu()
+        return is_npu_available()
     except ImportError:
         return False
 
 
 def get_device(local_rank: int) -> torch.device:
-    if _is_npu():
+    if is_npu_available():
         return torch.device("npu", local_rank)
     if _is_cuda() or _is_rocm():
         return torch.device("cuda", local_rank)
@@ -43,7 +43,7 @@ def get_device(local_rank: int) -> torch.device:
 
 
 def get_device_type() -> str:
-    if _is_npu():
+    if is_npu_available():
         return "npu"
     if _is_cuda() or _is_rocm():
         return "cuda"
@@ -54,7 +54,7 @@ def get_device_type() -> str:
 
 
 def get_torch_distributed_backend() -> str:
-    if _is_npu():
+    if is_npu_available():
         return "hccl"
     if _is_cuda() or _is_rocm():
         return "nccl"

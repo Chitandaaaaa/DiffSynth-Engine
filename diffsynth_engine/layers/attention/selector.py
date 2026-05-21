@@ -1,7 +1,8 @@
 from functools import cache
 
 from diffsynth_engine.layers.attention.backends.abstract import AttentionBackend, AttentionType
-from diffsynth_engine.utils.import_utils import LazyImport, is_npu_available
+from diffsynth_engine.utils.import_utils import LazyImport
+from diffsynth_engine.utils.platform import is_npu_available
 
 AiterBackend = LazyImport("diffsynth_engine.layers.attention.backends.aiter", "AiterBackend")
 AiterFP8Backend = LazyImport("diffsynth_engine.layers.attention.backends.aiter", "AiterFP8Backend")

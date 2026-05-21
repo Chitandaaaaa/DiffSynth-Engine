@@ -5,7 +5,7 @@ from diffsynth_engine.layers.attention.backends.abstract import (
     AttentionMetadata,
     AttentionType,
 )
-from diffsynth_engine.utils.import_utils import is_npu_available
+from diffsynth_engine.utils.platform import is_npu_available
 
 
 class MindieAttentionBackend(AttentionBackend):
