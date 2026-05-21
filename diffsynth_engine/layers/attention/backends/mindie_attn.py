@@ -45,13 +45,7 @@ class MindieAttentionImpl(AttentionImpl):
         num_kv_heads: int | None = None,
         **extra_impl_args,
     ) -> None:
-        if num_kv_heads is None:
-            num_kv_heads = num_heads
-        self.num_kv_groups = num_heads // num_kv_heads
-        self.causal = causal
-        self.softmax_scale = softmax_scale
-        self.num_heads = num_heads
-        self.head_size = head_size
+        self.scale = softmax_scale or (head_size ** -0.5)
 
     def forward(
         self,
@@ -63,17 +57,12 @@ class MindieAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         from mindiesd.layers.flash_attn.attention_forward import attention_forward
 
-        scale = self.softmax_scale
-        if scale is None:
-            scale = self.head_size ** -0.5
-
-        out = attention_forward(
+        return attention_forward(
             query=query,
             key=key,
             value=value,
             attn_mask=attn_mask,
-            scale=scale,
+            scale=self.scale,
             fused=True,
             head_first=False,
         )
-        return out
