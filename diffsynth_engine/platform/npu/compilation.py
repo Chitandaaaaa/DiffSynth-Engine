@@ -13,6 +13,6 @@ def apply_mindie_sd_compile(model: torch.nn.Module) -> torch.nn.Module:
     if not is_mindie_sd_available():
         return model
 
-    import mindiesd
+    from mindiesd.compilation import MindieSDBackend
 
-    return torch.compile(model, backend=mindiesd.MindieSDBackend())
+    return torch.compile(model, backend=MindieSDBackend())
