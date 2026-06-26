@@ -9,8 +9,8 @@ import torch.nn as nn
 from diffsynth_engine.distributed.comm import SeqAllToAll4D
 from diffsynth_engine.distributed.parallel_state import (
     get_ring_parallel_world_size,
-    get_sp_group,
     get_ulysses_parallel_world_size,
+    get_ulysses_process_group,
 )
 from diffsynth_engine.forward_context import ForwardContext, get_forward_context
 from diffsynth_engine.layers.attention.backends.abstract import AttentionType
@@ -143,9 +143,10 @@ class USPAttention(nn.Module):
         ring_parallel_world_size = get_ring_parallel_world_size() if dist.is_initialized() else 1
 
         if ulysses_parallel_world_size > 1:
-            q = SeqAllToAll4D.apply(get_sp_group().ulysses_group, q, self.scatter_idx, self.gather_idx)
-            k = SeqAllToAll4D.apply(get_sp_group().ulysses_group, k, self.scatter_idx, self.gather_idx)
-            v = SeqAllToAll4D.apply(get_sp_group().ulysses_group, v, self.scatter_idx, self.gather_idx)
+            ulysses_group = get_ulysses_process_group()
+            q = SeqAllToAll4D.apply(ulysses_group, q, self.scatter_idx, self.gather_idx)
+            k = SeqAllToAll4D.apply(ulysses_group, k, self.scatter_idx, self.gather_idx)
+            v = SeqAllToAll4D.apply(ulysses_group, v, self.scatter_idx, self.gather_idx)
 
         if ring_parallel_world_size > 1:
             # warning: attn_kwargs is not supported for ring flash attention
@@ -154,5 +155,6 @@ class USPAttention(nn.Module):
             output = self.attn_impl.forward(q, k, v, **attn_kwargs)
 
         if ulysses_parallel_world_size > 1:
-            output = SeqAllToAll4D.apply(get_sp_group().ulysses_group, output, self.gather_idx, self.scatter_idx)
+            ulysses_group = get_ulysses_process_group()
+            output = SeqAllToAll4D.apply(ulysses_group, output, self.gather_idx, self.scatter_idx)
         return output

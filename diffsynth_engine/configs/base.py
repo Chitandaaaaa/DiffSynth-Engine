@@ -1,10 +1,13 @@
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict, Optional, Tuple
 
+import os
+
 import torch
 
 from diffsynth_engine.layers.attention import AttentionType
 from diffsynth_engine.utils import logging
+from diffsynth_engine.utils.platform import get_device, get_device_type
 
 logger = logging.get_logger(__name__)
 
@@ -55,7 +58,18 @@ class PipelineConfig:
         return cls(**filtered_dict)
 
     def __post_init__(self):
+        resolve_pipeline_device(self)
         init_parallel_config(self)
+
+
+def resolve_pipeline_device(config: PipelineConfig) -> None:
+    """Map the default cuda placeholder to the active platform device."""
+    if config.device != "cuda":
+        return
+    if get_device_type() == "cuda":
+        return
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    config.device = get_device(local_rank)
 
 
 def init_parallel_config(config: PipelineConfig):

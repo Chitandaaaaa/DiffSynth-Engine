@@ -1,7 +1,10 @@
+import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.cuda import set_device
 
 from diffsynth_engine.configs import PipelineConfig
+from diffsynth_engine.distributed.parallel_state import get_world_group
+from diffsynth_engine.generate_kwargs import resolve_generate_kwargs
 from diffsynth_engine.pipelines.utils import (
     get_pipeline_class,
     get_pipeline_class_name,
@@ -37,7 +40,9 @@ class DiffSynthEngine:
 
         num_workers = pipeline_config.parallelism
         master_port = kwargs.get("master_port", 29500)
-        if num_workers > 1:
+        # torchrun process: dist already initialized in entry script
+        # mp.spawn parent: dist not initialized, need to spawn workers
+        if num_workers > 1 and not dist.is_initialized():
             instance._init_workers(num_workers, master_port)
         else:
             instance._init_pipeline()
@@ -87,8 +92,25 @@ class DiffSynthEngine:
     def generate(self, **kwargs):
         if self.workers is not None:
             return self._generate(**kwargs)
+        elif dist.is_initialized():
+            return self._generate_distributed(**kwargs)
         else:
-            return self.pipeline(**kwargs)
+            return self.pipeline(**resolve_generate_kwargs(kwargs))
+
+    def _generate_distributed(self, **kwargs):
+        world_group = get_world_group()
+        rank = dist.get_rank()
+
+        if rank == 0:
+            data = {"method": "__call__", "kwargs": kwargs}
+            world_group.broadcast_tensor_dict(data, src=0)
+        else:
+            data = world_group.broadcast_tensor_dict(src=0)
+
+        pipe_kwargs = resolve_generate_kwargs(dict(data["kwargs"]))
+        outputs = self.pipeline(**pipe_kwargs)
+        world_group.barrier()
+        return outputs if rank == 0 else None
 
     def _generate(self, **kwargs):
         # TODO: health check and timeout
