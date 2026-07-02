@@ -31,10 +31,17 @@ from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
 from diffsynth_engine.distributed.comm import SeqAllToAll4D
 from diffsynth_engine.distributed.parallel_state import (
     get_ring_parallel_world_size,
+    get_sequence_parallel_world_size,
     get_ulysses_parallel_world_size,
     get_ulysses_process_group,
+    model_parallel_is_initialized,
 )
-from diffsynth_engine.distributed.utils import sequence_parallel_shard, sequence_parallel_unshard
+from diffsynth_engine.distributed.utils import (
+    sequence_parallel_shard,
+    sequence_parallel_shard_edit_split,
+    sequence_parallel_unshard,
+    sequence_parallel_unshard_edit_output,
+)
 from diffsynth_engine.forward_context import ForwardContext, get_forward_context
 from diffsynth_engine.layers.attention import USPAttention
 from diffsynth_engine.layers.attention.ring import ring_flash_attention_forward
@@ -42,6 +49,12 @@ from diffsynth_engine.models.base import DiffusionModel
 from diffsynth_engine.utils import logging
 
 logger = logging.get_logger(__name__)
+
+
+def _compute_output_token_len(img_shapes: Optional[List[List[tuple]]]) -> Optional[int]:
+    if not img_shapes or not img_shapes[0]:
+        return None
+    return prod(img_shapes[0][0])
 
 
 def apply_rotary_emb_qwen(
@@ -831,6 +844,8 @@ class QwenImageTransformer2DModel(DiffusionModel):
 
         timestep = timestep.to(hidden_states.dtype)
 
+        output_token_len = _compute_output_token_len(img_shapes) if self.zero_cond_t else None
+
         if self.zero_cond_t:
             timestep = torch.cat([timestep, timestep * 0], dim=0)
             modulate_index = torch.tensor(
@@ -852,10 +867,12 @@ class QwenImageTransformer2DModel(DiffusionModel):
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
         image_rotary_emb = self.pos_embed(img_shapes, max_txt_seq_len=text_seq_len, device=hidden_states.device)
+        img_freqs, txt_freqs = image_rotary_emb
 
         # Construct joint attention mask once to avoid reconstructing in every block
         # This eliminates 60 GPU syncs during training while maintaining torch.compile compatibility
         block_attention_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
+        joint_attention_mask = None
         if encoder_hidden_states_mask is not None:
             # Build joint mask: [text_mask, all_ones_for_image]
             batch_size, image_seq_len = hidden_states.shape[:2]
@@ -863,12 +880,23 @@ class QwenImageTransformer2DModel(DiffusionModel):
             joint_attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
             block_attention_kwargs["attention_mask"] = joint_attention_mask
 
-        img_freqs, txt_freqs = image_rotary_emb
-        hidden_states, encoder_hidden_states, img_freqs, txt_freqs, modulate_index = sequence_parallel_shard(
-            (hidden_states, encoder_hidden_states, img_freqs, txt_freqs, modulate_index),
-            seq_dims=(1, 1, 0, 0, 1),
+        hidden_states, encoder_hidden_states, img_freqs, txt_freqs, modulate_index = (
+            sequence_parallel_shard_edit_split(
+                (hidden_states, encoder_hidden_states, img_freqs, txt_freqs, modulate_index),
+                seq_dims=(1, 1, 0, 0, 1),
+                output_len=output_token_len,
+            )
+            if self.zero_cond_t
+            and output_token_len is not None
+            and model_parallel_is_initialized()
+            and get_sequence_parallel_world_size() > 1
+            else sequence_parallel_shard(
+                (hidden_states, encoder_hidden_states, img_freqs, txt_freqs, modulate_index),
+                seq_dims=(1, 1, 0, 0, 1),
+            )
         )
         image_rotary_emb = (img_freqs, txt_freqs)
+
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
@@ -891,7 +919,20 @@ class QwenImageTransformer2DModel(DiffusionModel):
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
-        (output,) = sequence_parallel_unshard((output,), seq_dims=(1,), seq_lens=(image_seq_len,))
+        if (
+            self.zero_cond_t
+            and output_token_len is not None
+            and model_parallel_is_initialized()
+            and get_sequence_parallel_world_size() > 1
+        ):
+            (output,) = sequence_parallel_unshard_edit_output(
+                (output,),
+                seq_dims=(1,),
+                output_len=output_token_len,
+                total_image_seq_len=image_seq_len,
+            )
+        else:
+            (output,) = sequence_parallel_unshard((output,), seq_dims=(1,), seq_lens=(image_seq_len,))
 
         if not return_dict:
             return (output,)
