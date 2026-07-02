@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention import FeedForward
@@ -27,9 +28,16 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
 
+from diffsynth_engine.distributed.comm import SeqAllToAll4D
+from diffsynth_engine.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_world_size,
+    get_ulysses_process_group,
+)
 from diffsynth_engine.distributed.utils import sequence_parallel_shard, sequence_parallel_unshard
-from diffsynth_engine.forward_context import get_forward_context
+from diffsynth_engine.forward_context import ForwardContext, get_forward_context
 from diffsynth_engine.layers.attention import USPAttention
+from diffsynth_engine.layers.attention.ring import ring_flash_attention_forward
 from diffsynth_engine.models.base import DiffusionModel
 from diffsynth_engine.utils import logging
 
@@ -500,13 +508,44 @@ class QwenDoubleStreamAttention(nn.Module):
             txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
             txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
 
-        # Concatenate for joint attention: [text, image]
-        joint_query = torch.cat([txt_query, img_query], dim=1)  # [B, S_txt+S_img, H, D]
+        seq_txt_local = txt_query.shape[1]
+        ulysses_parallel_world_size = get_ulysses_parallel_world_size() if dist.is_initialized() else 1
+        ring_parallel_world_size = get_ring_parallel_world_size() if dist.is_initialized() else 1
+
+        if ulysses_parallel_world_size > 1:
+            ulysses_group = get_ulysses_process_group()
+            txt_query = SeqAllToAll4D.apply(ulysses_group, txt_query, 2, 1)
+            txt_key = SeqAllToAll4D.apply(ulysses_group, txt_key, 2, 1)
+            txt_value = SeqAllToAll4D.apply(ulysses_group, txt_value, 2, 1)
+            img_query = SeqAllToAll4D.apply(ulysses_group, img_query, 2, 1)
+            img_key = SeqAllToAll4D.apply(ulysses_group, img_key, 2, 1)
+            img_value = SeqAllToAll4D.apply(ulysses_group, img_value, 2, 1)
+
+        seq_txt = txt_query.shape[1]
+        joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        # Apply joint attention
-        joint_hidden_states = self.usp_attn(joint_query, joint_key, joint_value, attn_mask=attention_mask)
+        forward_context: ForwardContext = get_forward_context()
+        attn_kwargs = {"attn_metadata": forward_context.attn_metadata, "attn_mask": attention_mask}
+
+        if ring_parallel_world_size > 1:
+            joint_hidden_states = ring_flash_attention_forward(
+                joint_query, joint_key, joint_value, self.usp_attn.attn_impl
+            )
+        else:
+            joint_hidden_states = self.usp_attn.attn_impl.forward(
+                joint_query, joint_key, joint_value, **attn_kwargs
+            )
+
+        if ulysses_parallel_world_size > 1:
+            ulysses_group = get_ulysses_process_group()
+            txt_hidden_states = joint_hidden_states[:, :seq_txt, :]
+            img_hidden_states = joint_hidden_states[:, seq_txt:, :]
+            txt_hidden_states = SeqAllToAll4D.apply(ulysses_group, txt_hidden_states, 1, 2)
+            img_hidden_states = SeqAllToAll4D.apply(ulysses_group, img_hidden_states, 1, 2)
+            joint_hidden_states = torch.cat([txt_hidden_states, img_hidden_states], dim=1)
+            seq_txt = seq_txt_local
 
         # Reshape back: [B, S, H, D] -> [B, S, H*D]
         joint_hidden_states = joint_hidden_states.flatten(2, 3)
