@@ -1,7 +1,8 @@
 from typing import Any
 
 import torch.multiprocessing as mp
-from torch.cuda import set_device
+from diffsynth_engine.generate_kwargs import resolve_generate_kwargs
+from diffsynth_engine.utils.platform import set_local_device
 
 from diffsynth_engine.configs import PipelineConfig
 from diffsynth_engine.registry import (
@@ -168,7 +169,7 @@ class LocalEngine(DiffSynthEngine):
         self.pipeline = pipeline_class.from_pretrained(pipeline_config)
 
     def generate(self, **kwargs):
-        return self.pipeline(**kwargs)
+        return self.pipeline(**resolve_generate_kwargs(kwargs))
 
     def shutdown(self):
         if self.pipeline is not None:
@@ -213,7 +214,7 @@ class DistributedEngine(DiffSynthEngine):
     def __init__(self, pipeline_config: PipelineConfig, num_workers: int, master_port: int):
         logger.info(f"Initializing {num_workers} workers...")
 
-        set_device(0)
+        set_local_device(0)
 
         self.workers = []
         self.conns = []

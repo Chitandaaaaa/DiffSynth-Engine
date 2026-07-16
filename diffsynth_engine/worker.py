@@ -9,6 +9,7 @@ from diffsynth_engine.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from diffsynth_engine.generate_kwargs import resolve_generate_kwargs
 from diffsynth_engine.registry import get_pipeline_class
 from diffsynth_engine.utils import logging
 from diffsynth_engine.utils.torch_profiler import TorchProfiler
@@ -58,7 +59,7 @@ class Worker:
         self.pipeline = pipeline_class.from_pretrained(self.pipeline_config)
 
     def __call__(self, **kwargs):
-        return self.pipeline(**kwargs)
+        return self.pipeline(**resolve_generate_kwargs(kwargs))
 
     def start_profile(self, **kwargs):
         path = kwargs.get("path", ".")

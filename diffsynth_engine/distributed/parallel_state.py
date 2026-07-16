@@ -13,7 +13,6 @@ from typing import List, Optional
 
 import torch
 import torch.distributed
-from torch.cuda import device_count, set_device
 
 from diffsynth_engine.distributed.group_coordinator import (
     GroupCoordinator,
@@ -22,7 +21,11 @@ from diffsynth_engine.distributed.group_coordinator import (
 )
 from diffsynth_engine.utils import logging
 from diffsynth_engine.utils.constants import IDLE_TIMEOUT_SEC
-from diffsynth_engine.utils.platform import get_torch_distributed_backend
+from diffsynth_engine.utils.platform import (
+    device_count,
+    get_torch_distributed_backend,
+    set_local_device,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -280,6 +283,35 @@ def get_ulysses_parallel_rank():
     return get_sp_group().ulysses_rank
 
 
+def _use_default_world_device_group(group_world_size: int) -> bool:
+    """Return True when a parallel group spans all ranks and should use default WORLD."""
+    return group_world_size == torch.distributed.get_world_size()
+
+
+def get_ulysses_process_group():
+    """ProcessGroup for ulysses collectives (all_to_all / all_gather).
+
+    When ulysses spans all WORLD ranks (e.g. ulysses=4 on 4 cards with cfg=1),
+    return None so collectives use the default HCCL WORLD group. NPU HCCL
+    subgroups from new_group() are unreliable for device collectives.
+    """
+    sp_group = get_sp_group()
+    if _use_default_world_device_group(sp_group.ulysses_world_size):
+        return None
+    return sp_group.ulysses_group
+
+
+def get_sp_device_process_group():
+    """ProcessGroup for SP device collectives such as sequence_parallel_unshard.
+
+    Same WORLD fallback as ulysses when SP covers every rank.
+    """
+    sp_group = get_sp_group()
+    if _use_default_world_device_group(sp_group.world_size):
+        return None
+    return sp_group.device_group
+
+
 def get_ring_parallel_world_size():
     return get_sp_group().ring_world_size
 
@@ -425,6 +457,19 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
+    # local_rank is not available in torch ProcessGroup,
+    # see https://github.com/pytorch/pytorch/issues/122816
+    if local_rank == -1:
+        if distributed_init_method == "env://":
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        else:
+            local_rank = rank
+
+    num_devices = device_count()
+    device_id = local_rank if local_rank >= 0 else (rank % max(num_devices, 1))
+    # HCCL requires set_device before init_process_group on Ascend.
+    set_local_device(device_id)
+
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing distributed environment"
@@ -436,17 +481,6 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
         )
-        set_device(torch.distributed.get_rank() % device_count())
-    # set the local rank
-    # local_rank is not available in torch ProcessGroup,
-    # see https://github.com/pytorch/pytorch/issues/122816
-    if local_rank == -1:
-        # local rank not set, this usually happens in single-node
-        # setting, where we can use rank as local rank
-        if distributed_init_method == "env://":
-            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        else:
-            local_rank = rank
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))

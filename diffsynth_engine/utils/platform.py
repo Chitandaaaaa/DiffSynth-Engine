@@ -64,6 +64,34 @@ def get_torch_distributed_backend() -> str:
         raise NotImplementedError("Unsupported device type")
 
 
+def device_synchronize() -> None:
+    if is_npu_available():
+        import torch_npu
+
+        torch_npu.npu.synchronize()
+    elif _is_cuda() or _is_rocm():
+        torch.cuda.synchronize()
+
+
+def device_count() -> int:
+    if is_npu_available():
+        import torch_npu
+
+        return torch_npu.npu.device_count()
+    if _is_cuda() or _is_rocm():
+        return torch.cuda.device_count()
+    return 1
+
+
+def set_local_device(device_id: int) -> None:
+    if is_npu_available():
+        import torch_npu
+
+        torch_npu.npu.set_device(device_id)
+    elif _is_cuda() or _is_rocm():
+        torch.cuda.set_device(device_id)
+
+
 DTYPE_FP8 = torch.float8_e4m3fnuz if _is_rocm() else torch.float8_e4m3fn
 
 DTYPE_MAP: dict[str, torch.dtype] = {

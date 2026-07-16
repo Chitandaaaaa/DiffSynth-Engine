@@ -12,11 +12,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
-from torch.cuda import synchronize
 from torch.distributed import Backend, ProcessGroup
 
 from diffsynth_engine.utils import logging
-from diffsynth_engine.utils.platform import get_device
+from diffsynth_engine.utils.platform import device_synchronize, get_device
+
+# Sentinel: omit `group` to use self.device_group; pass group=None for default WORLD.
+_USE_DEVICE_GROUP = object()
 
 logger = logging.get_logger(__name__)
 
@@ -200,7 +202,11 @@ class GroupCoordinator:
         return input_
 
     def all_gather(
-        self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False
+        self,
+        input_: torch.Tensor,
+        dim: int = 0,
+        separate_tensors: bool = False,
+        group: Union[ProcessGroup, None, object] = _USE_DEVICE_GROUP,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
@@ -210,12 +216,13 @@ class GroupCoordinator:
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
+        collective_group = self.device_group if group is _USE_DEVICE_GROUP else group
         # Allocate output tensor.
         input_size = list(input_.size())
         input_size[0] *= world_size
         output_tensor = torch.empty(input_size, dtype=input_.dtype, device=input_.device)
         # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        torch.distributed.all_gather_into_tensor(output_tensor, input_, group=collective_group)
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
@@ -764,7 +771,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         # To protect against race condition when using batch_isend_irecv().
         # should take this out once the bug with batch_isend_irecv is resolved.
-        synchronize()
+        device_synchronize()
 
         ops = []
         recv_prev_shape_tensor = None
@@ -795,7 +802,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
             for req in reqs:
                 req.wait()
 
-        synchronize()
+        device_synchronize()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
