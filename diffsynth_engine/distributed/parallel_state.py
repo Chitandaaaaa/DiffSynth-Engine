@@ -283,22 +283,6 @@ def get_ulysses_parallel_rank():
     return get_sp_group().ulysses_rank
 
 
-def _use_default_world_device_group(group_world_size: int) -> bool:
-    """Return True when a parallel group spans all ranks and should use default WORLD."""
-    return group_world_size == torch.distributed.get_world_size()
-
-
-def get_sp_device_process_group():
-    """ProcessGroup for SP device collectives such as sequence_parallel_unshard.
-
-    When SP covers every WORLD rank, return None so collectives use default WORLD.
-    """
-    sp_group = get_sp_group()
-    if _use_default_world_device_group(sp_group.world_size):
-        return None
-    return sp_group.device_group
-
-
 def get_ring_parallel_world_size():
     return get_sp_group().ring_world_size
 

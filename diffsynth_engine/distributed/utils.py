@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from diffsynth_engine.distributed.parallel_state import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
-    get_sp_device_process_group,
     get_sp_group,
     model_parallel_is_initialized,
 )
@@ -53,11 +52,10 @@ def sequence_parallel_unshard(
     assert len(tensors) == len(seq_dims), "tensors and seq_dims must have the same number of elements"
     assert len(tensors) == len(seq_lens), "tensors and seq_lens must have the same number of elements"
 
-    device_group = get_sp_device_process_group()
     unshard_tensors = []
     for tensor, seq_dim, seq_len in zip(tensors, seq_dims, seq_lens):
         tensor = tensor.contiguous()
-        unshard = sp_group.all_gather(tensor, dim=seq_dim, group=device_group)
+        unshard = sp_group.all_gather(tensor, dim=seq_dim)
         unshard = unshard.narrow(dim=seq_dim, start=0, length=seq_len)
         unshard_tensors.append(unshard)
     return unshard_tensors
