@@ -288,23 +288,10 @@ def _use_default_world_device_group(group_world_size: int) -> bool:
     return group_world_size == torch.distributed.get_world_size()
 
 
-def get_ulysses_process_group():
-    """ProcessGroup for ulysses collectives (all_to_all / all_gather).
-
-    When ulysses spans all WORLD ranks (e.g. ulysses=4 on 4 cards with cfg=1),
-    return None so collectives use the default HCCL WORLD group. NPU HCCL
-    subgroups from new_group() are unreliable for device collectives.
-    """
-    sp_group = get_sp_group()
-    if _use_default_world_device_group(sp_group.ulysses_world_size):
-        return None
-    return sp_group.ulysses_group
-
-
 def get_sp_device_process_group():
     """ProcessGroup for SP device collectives such as sequence_parallel_unshard.
 
-    Same WORLD fallback as ulysses when SP covers every rank.
+    When SP covers every WORLD rank, return None so collectives use default WORLD.
     """
     sp_group = get_sp_group()
     if _use_default_world_device_group(sp_group.world_size):
