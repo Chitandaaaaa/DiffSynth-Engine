@@ -36,6 +36,59 @@ from diffsynth_engine.utils import logging
 logger = logging.get_logger(__name__)
 
 
+# ==================== First-4-Blocks Profiling ====================
+# Script injects a profiler via register_multi_block_profiler(); the block
+# loop starts/steps/stops around the first 4 blocks (index 0-3).
+
+_PROFILE_BLOCK_COUNT = 4
+_blocks_profiled = 0
+_profile_limit_reached = False
+_multi_block_profiler = None
+
+
+def register_multi_block_profiler(profiler):
+    """Register a not-yet-started profiler for first-4-blocks profiling."""
+    global _multi_block_profiler
+    _multi_block_profiler = profiler
+    logger.info("[MultiBlockProfiling] Profiler registered — will capture the first 4 blocks")
+
+
+def reset_multi_block_profiler():
+    """Reset profiling state so a new profiler can be registered and used."""
+    global _blocks_profiled, _profile_limit_reached, _multi_block_profiler
+    _blocks_profiled = 0
+    _profile_limit_reached = False
+    _multi_block_profiler = None
+    logger.info("[MultiBlockProfiling] State reset")
+
+
+def _start_block_profiling():
+    global _profile_limit_reached
+    if _profile_limit_reached:
+        return
+    profiler = _multi_block_profiler
+    if profiler is not None:
+        profiler.__enter__()
+        logger.info("[MultiBlockProfiling] Started")
+
+
+def _step_block_profiling():
+    global _blocks_profiled, _profile_limit_reached, _multi_block_profiler
+    if _profile_limit_reached:
+        return
+    profiler = _multi_block_profiler
+    if profiler is None:
+        return
+    _blocks_profiled += 1
+    if _blocks_profiled >= _PROFILE_BLOCK_COUNT:
+        profiler.step()
+        profiler.__exit__(None, None, None)
+        _profile_limit_reached = True
+        logger.info("[MultiBlockProfiling] Stopped — first-4-blocks profiling complete")
+    else:
+        profiler.step()
+
+
 def apply_rotary_emb_qwen(
     x: torch.Tensor,
     freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor]],
@@ -833,6 +886,9 @@ class QwenImageTransformer2DModel(DiffusionModel):
         )
         image_rotary_emb = (img_freqs, txt_freqs)
         for index_block, block in enumerate(self.transformer_blocks):
+            if index_block == 0:
+                _start_block_profiling()
+
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -842,6 +898,9 @@ class QwenImageTransformer2DModel(DiffusionModel):
                 joint_attention_kwargs=block_attention_kwargs,
                 modulate_index=modulate_index,
             )
+
+            if index_block < _PROFILE_BLOCK_COUNT:
+                _step_block_profiling()
 
             # controlnet residual
             if controlnet_block_samples is not None:
