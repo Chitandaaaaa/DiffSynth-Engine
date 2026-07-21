@@ -16,6 +16,21 @@ from diffsynth_engine.forward_context import ForwardContext, get_forward_context
 from diffsynth_engine.layers.attention.ring import ring_flash_attention_forward
 from diffsynth_engine.registry import get_attn_backend
 
+# Auto FA head-split for power capping (no user-facing fa_split config).
+# Each local FA kernel targets at most this many heads when divisible.
+# Example: Qwen heads=24 → fa_split=4 (6 heads per chunk).
+_PREFERRED_HEADS_PER_CHUNK = 6
+
+
+def _auto_fa_split(local_heads: int, preferred: int = _PREFERRED_HEADS_PER_CHUNK) -> int:
+    """Auto-derive how many head-chunks to split local FA into."""
+    if local_heads <= preferred:
+        return 1
+    for heads_per_chunk in range(preferred, 0, -1):
+        if local_heads % heads_per_chunk == 0:
+            return local_heads // heads_per_chunk
+    return 1
+
 
 class LocalAttention(nn.Module):
     def __init__(
@@ -116,6 +131,31 @@ class USPAttention(nn.Module):
             **extra_impl_args,
         )
 
+    def _split_qkv_by_head(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, parts: int):
+        # q/k/v: [B, S, H, D]
+        _, _, head_count, _ = q.shape
+        if head_count % parts != 0:
+            raise ValueError(f"num_heads ({head_count}) must be divisible by fa_split ({parts}).")
+        chunk = head_count // parts
+        return q.split(chunk, dim=2), k.split(chunk, dim=2), v.split(chunk, dim=2)
+
+    def _local_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_kwargs: dict,
+    ) -> torch.Tensor:
+        local_heads = q.shape[2]
+        parts = _auto_fa_split(local_heads)
+        if parts <= 1:
+            return self.attn_impl.forward(q, k, v, **attn_kwargs)
+        q_chunks, k_chunks, v_chunks = self._split_qkv_by_head(q, k, v, parts)
+        outs = []
+        for qc, kc, vc in zip(q_chunks, k_chunks, v_chunks):
+            outs.append(self.attn_impl.forward(qc, kc, vc, **attn_kwargs))
+        return torch.cat(outs, dim=2)
+
     @torch.compiler.disable
     def forward(
         self,
@@ -156,7 +196,7 @@ class USPAttention(nn.Module):
             # warning: attn_kwargs is not supported for ring flash attention
             output = ring_flash_attention_forward(q, k, v, self.attn_impl, **attn_kwargs)
         else:
-            output = self.attn_impl.forward(q, k, v, **attn_kwargs)
+            output = self._local_attention(q, k, v, attn_kwargs)
 
         if ulysses_parallel_world_size > 1:
             output = SeqAllToAll4D.apply(get_sp_group().ulysses_group, output, self.gather_idx, self.scatter_idx)
