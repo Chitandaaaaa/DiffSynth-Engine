@@ -347,34 +347,50 @@ def _npu_ulysses_mindie_attention(
     attn_mask: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
 ):
-    """Ulysses SP on NPU: SeqAllToAll4D + MindIE local attn. ring_degree>1 not supported."""
+    """NPU USP: optional Ulysses AllToAll + (Ring fusion-attn | MindIE local attn).
+
+    - ulysses>1: SeqAllToAll4D on the Ulysses group (head <-> seq).
+    - ring>1: ``npu_ring_attention`` (npu_fusion_attention + max/sum merge + KV rotate).
+    - ring==1: keep MindIE ``attention_forward`` (existing Ulysses-only path).
+    """
     from yunchang.comm.all_to_all import SeqAllToAll4D
 
-    from diffsynth_engine.utils.process_group import get_sp_ring_world_size, get_sp_ulysses_group
+    from diffsynth_engine.utils.process_group import (
+        get_sp_ring_world_size,
+        get_sp_ulysses_group,
+        get_sp_ulysses_world_size,
+    )
 
     if q.device.type != "npu":
         raise RuntimeError("mindie long-context attention is only supported on NPU")
-    if not MINDIE_AVAILABLE:
+    assert attn_mask is None, "long context attention does not support attention mask"
+
+    ulysses_size = get_sp_ulysses_world_size()
+    ring_size = get_sp_ring_world_size()
+
+    if ring_size <= 1 and not MINDIE_AVAILABLE:
         raise RuntimeError(
             "NPU Ulysses sequence parallel requires MindIE attention, but MindIE-SD is not available"
         )
-    if get_sp_ring_world_size() > 1:
-        raise RuntimeError(
-            "NPU long-context attention currently supports Ulysses only "
-            f"(sp_ring_degree must be 1, got {get_sp_ring_world_size()})"
-        )
-    assert attn_mask is None, "long context attention does not support attention mask"
 
     # scatter heads (dim=2), gather sequence (dim=1) — same as video_sparse / v1 USP
     scatter_idx, gather_idx = 2, 1
-    group = get_sp_ulysses_group()
-    q = SeqAllToAll4D.apply(group, q, scatter_idx, gather_idx)
-    k = SeqAllToAll4D.apply(group, k, scatter_idx, gather_idx)
-    v = SeqAllToAll4D.apply(group, v, scatter_idx, gather_idx)
+    ulysses_group = get_sp_ulysses_group()
+    if ulysses_size > 1:
+        q = SeqAllToAll4D.apply(ulysses_group, q, scatter_idx, gather_idx)
+        k = SeqAllToAll4D.apply(ulysses_group, k, scatter_idx, gather_idx)
+        v = SeqAllToAll4D.apply(ulysses_group, v, scatter_idx, gather_idx)
 
     # Must not call attention() here — it is patched to long_context_attention under SP.
-    out = mindie_attn(q, k, v, attn_mask=attn_mask, scale=scale)
-    out = SeqAllToAll4D.apply(group, out, gather_idx, scatter_idx)
+    if ring_size > 1:
+        from diffsynth_engine.models.basic.npu_ring_attn import npu_ring_attention
+
+        out = npu_ring_attention(q, k, v, scale=scale, attn_mask=attn_mask)
+    else:
+        out = mindie_attn(q, k, v, attn_mask=attn_mask, scale=scale)
+
+    if ulysses_size > 1:
+        out = SeqAllToAll4D.apply(ulysses_group, out, gather_idx, scatter_idx)
     return out
 
 
@@ -413,7 +429,7 @@ def long_context_attention(
     assert attn_mask is None, "long context attention does not support attention mask"
     flash_attn3_compatible = q.shape[-1] <= FA3_MAX_HEADDIM
     if attn_impl is None or attn_impl == "auto":
-        # NPU has no FA/yunchang TORCH_EFFICIENT kernel; pick MindIE Ulysses when available.
+        # NPU: Ulysses (+ optional Ring) via MindIE / npu_fusion_attention.
         if q.device.type == "npu" and MINDIE_AVAILABLE:
             return _npu_ulysses_mindie_attention(q, k, v, attn_mask=attn_mask, scale=scale)
         if FLASH_ATTN_3_AVAILABLE:
