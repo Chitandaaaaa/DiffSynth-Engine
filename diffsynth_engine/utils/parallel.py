@@ -242,6 +242,72 @@ def _bind_config_device_rank(kwargs: dict, device: torch.device) -> None:
     config.device = str(device)
 
 
+def _create_rank0_e2e_profiler(output_dir: str, device_type: str):
+    """Build a one-shot e2e profiler for ParallelWrapper rank0 ``__call__``.
+
+    Defaults match typical Ascend e2e capture: schedule active=1, data_simplification=True.
+    """
+    if device_type != "npu":
+        raise RuntimeError(
+            f"rank0 e2e profiler is only implemented for NPU, got device_type={device_type!r}"
+        )
+    import torch_npu
+
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        data_simplification=True,
+        msprof_tx=False,
+        l2_cache=False,
+        op_attr=False,
+        record_op_args=False,
+    )
+    return torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        schedule=torch_npu.profiler.schedule(
+            wait=0,
+            warmup=0,
+            active=1,
+            repeat=1,
+            skip_first=0,
+        ),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(output_dir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+        with_flops=False,
+        experimental_config=experimental_config,
+    )
+
+
+def _invoke_module_method(
+    module,
+    name: str,
+    args,
+    kwargs,
+    *,
+    rank: int,
+    device_type: str,
+    profile_dir: Optional[str],
+):
+    """Call ``module.name``; optionally wrap rank0 ``__call__`` with e2e profiler."""
+    do_profile = rank == 0 and name == "__call__" and bool(profile_dir)
+    if not do_profile:
+        return getattr(module, name)(*args, **kwargs)
+
+    os.makedirs(profile_dir, exist_ok=True)
+    logger.info(f"[ParallelWrapper] rank0 e2e profiler ON → {profile_dir}")
+    prof = _create_rank0_e2e_profiler(profile_dir, device_type)
+    with prof:
+        res = getattr(module, name)(*args, **kwargs)
+        resolve_platform(device_type).synchronize()
+        prof.step()
+    return res
+
+
 def _worker_loop(
     rank: int,
     world_size: int,
@@ -314,6 +380,8 @@ def _worker_loop(
 
         module = None
         data, args, kwargs = None, None, None
+        # Set by enable_rank0_profiler / clear by disable_rank0_profiler (all ranks).
+        profile_dir: Optional[str] = None
 
         while True:
             res = None
@@ -322,6 +390,10 @@ def _worker_loop(
             if (name := data[0]) == "unload_module":
                 module = None
                 empty_cache()
+            elif name == "enable_rank0_profiler":
+                profile_dir = data[1]
+            elif name == "disable_rank0_profiler":
+                profile_dir = None
             elif name == "load_module":
                 init_fn, kwargs = data[1:]
                 _bind_config_device_rank(kwargs, device)
@@ -333,7 +405,15 @@ def _worker_loop(
             else:
                 args, kwargs = to_device(data[1:], device=device)
                 with torch.no_grad():
-                    res = getattr(module, name)(*args, **kwargs)
+                    res = _invoke_module_method(
+                        module,
+                        name,
+                        args,
+                        kwargs,
+                        rank=rank,
+                        device_type=device_type,
+                        profile_dir=profile_dir,
+                    )
 
             if rank == 0:
                 queue_out.put(res)
@@ -426,6 +506,46 @@ class ParallelWrapper:
             logger.error(f"[ParallelWrapper] unload_module error: {e}")
             raise RuntimeError(f"[ParallelWrapper] unload_module error: {e}")
         logger.info("[ParallelWrapper] unload_module done")
+
+    def enable_rank0_profiler(self, output_dir: str) -> None:
+        """Enable e2e profiling on worker rank0 for subsequent ``__call__`` invocations.
+
+        Warmup should run before this. Only rank0 writes traces under ``output_dir``.
+        """
+        if not output_dir:
+            raise ValueError("output_dir must be a non-empty path")
+        os.makedirs(output_dir, exist_ok=True)
+        data = ["enable_rank0_profiler", os.path.abspath(output_dir)]
+        for q in self.queue_in:
+            q.put(data)
+        try:
+            res = self.queue_out.get(timeout=PARALLEL_FWD_TIMEOUT_SEC)
+            if isinstance(res, Exception):
+                raise res
+        except Empty:
+            logger.error("[ParallelWrapper] enable_rank0_profiler timeout")
+            raise RuntimeError("[ParallelWrapper] enable_rank0_profiler timeout")
+        except Exception as e:
+            logger.error(f"[ParallelWrapper] enable_rank0_profiler error: {e}")
+            raise RuntimeError(f"[ParallelWrapper] enable_rank0_profiler error: {e}")
+        logger.info(f"[ParallelWrapper] enable_rank0_profiler → {output_dir}")
+
+    def disable_rank0_profiler(self) -> None:
+        """Disable rank0 e2e profiling for subsequent ``__call__`` invocations."""
+        data = ["disable_rank0_profiler", None]
+        for q in self.queue_in:
+            q.put(data)
+        try:
+            res = self.queue_out.get(timeout=PARALLEL_FWD_TIMEOUT_SEC)
+            if isinstance(res, Exception):
+                raise res
+        except Empty:
+            logger.error("[ParallelWrapper] disable_rank0_profiler timeout")
+            raise RuntimeError("[ParallelWrapper] disable_rank0_profiler timeout")
+        except Exception as e:
+            logger.error(f"[ParallelWrapper] disable_rank0_profiler error: {e}")
+            raise RuntimeError(f"[ParallelWrapper] disable_rank0_profiler error: {e}")
+        logger.info("[ParallelWrapper] disable_rank0_profiler")
 
     def __call__(self, *args, **kwargs):
         data = ["__call__", args, kwargs]
