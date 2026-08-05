@@ -242,10 +242,11 @@ def _bind_config_device_rank(kwargs: dict, device: torch.device) -> None:
     config.device = str(device)
 
 
-def _create_rank0_e2e_profiler(output_dir: str, device_type: str):
+def _create_rank0_e2e_profiler(output_dir: str, device_type: str, *, with_stack: bool = False):
     """Build a one-shot e2e profiler for ParallelWrapper rank0 ``__call__``.
 
     Defaults match typical Ascend e2e capture: schedule active=1, data_simplification=True.
+    Set ``with_stack=True`` to record Python call stacks (larger traces).
     """
     if device_type != "npu":
         raise RuntimeError(
@@ -277,7 +278,7 @@ def _create_rank0_e2e_profiler(output_dir: str, device_type: str):
         on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(output_dir),
         record_shapes=True,
         profile_memory=True,
-        with_stack=False,
+        with_stack=with_stack,
         with_flops=False,
         experimental_config=experimental_config,
     )
@@ -292,6 +293,7 @@ def _invoke_module_method(
     rank: int,
     device_type: str,
     profile_dir: Optional[str],
+    profile_with_stack: bool = False,
 ):
     """Call ``module.name``; optionally wrap rank0 ``__call__`` with e2e profiler."""
     do_profile = rank == 0 and name == "__call__" and bool(profile_dir)
@@ -299,8 +301,12 @@ def _invoke_module_method(
         return getattr(module, name)(*args, **kwargs)
 
     os.makedirs(profile_dir, exist_ok=True)
-    logger.info(f"[ParallelWrapper] rank0 e2e profiler ON → {profile_dir}")
-    prof = _create_rank0_e2e_profiler(profile_dir, device_type)
+    logger.info(
+        f"[ParallelWrapper] rank0 e2e profiler ON → {profile_dir} (with_stack={profile_with_stack})"
+    )
+    prof = _create_rank0_e2e_profiler(
+        profile_dir, device_type, with_stack=profile_with_stack
+    )
     with prof:
         res = getattr(module, name)(*args, **kwargs)
         resolve_platform(device_type).synchronize()
@@ -382,6 +388,7 @@ def _worker_loop(
         data, args, kwargs = None, None, None
         # Set by enable_rank0_profiler / clear by disable_rank0_profiler (all ranks).
         profile_dir: Optional[str] = None
+        profile_with_stack: bool = False
 
         while True:
             res = None
@@ -392,8 +399,10 @@ def _worker_loop(
                 empty_cache()
             elif name == "enable_rank0_profiler":
                 profile_dir = data[1]
+                profile_with_stack = bool(data[2]) if len(data) > 2 else False
             elif name == "disable_rank0_profiler":
                 profile_dir = None
+                profile_with_stack = False
             elif name == "load_module":
                 init_fn, kwargs = data[1:]
                 _bind_config_device_rank(kwargs, device)
@@ -413,6 +422,7 @@ def _worker_loop(
                         rank=rank,
                         device_type=device_type,
                         profile_dir=profile_dir,
+                        profile_with_stack=profile_with_stack,
                     )
 
             if rank == 0:
@@ -507,15 +517,16 @@ class ParallelWrapper:
             raise RuntimeError(f"[ParallelWrapper] unload_module error: {e}")
         logger.info("[ParallelWrapper] unload_module done")
 
-    def enable_rank0_profiler(self, output_dir: str) -> None:
+    def enable_rank0_profiler(self, output_dir: str, *, with_stack: bool = False) -> None:
         """Enable e2e profiling on worker rank0 for subsequent ``__call__`` invocations.
 
         Warmup should run before this. Only rank0 writes traces under ``output_dir``.
+        Set ``with_stack=True`` to record Python stacks (larger / slower exports).
         """
         if not output_dir:
             raise ValueError("output_dir must be a non-empty path")
         os.makedirs(output_dir, exist_ok=True)
-        data = ["enable_rank0_profiler", os.path.abspath(output_dir)]
+        data = ["enable_rank0_profiler", os.path.abspath(output_dir), bool(with_stack)]
         for q in self.queue_in:
             q.put(data)
         try:
@@ -528,8 +539,9 @@ class ParallelWrapper:
         except Exception as e:
             logger.error(f"[ParallelWrapper] enable_rank0_profiler error: {e}")
             raise RuntimeError(f"[ParallelWrapper] enable_rank0_profiler error: {e}")
-        logger.info(f"[ParallelWrapper] enable_rank0_profiler → {output_dir}")
-
+        logger.info(
+            f"[ParallelWrapper] enable_rank0_profiler → {output_dir} (with_stack={with_stack})"
+        )
     def disable_rank0_profiler(self) -> None:
         """Disable rank0 e2e profiling for subsequent ``__call__`` invocations."""
         data = ["disable_rank0_profiler", None]
