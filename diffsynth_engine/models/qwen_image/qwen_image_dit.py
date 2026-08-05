@@ -329,8 +329,9 @@ class QwenImageTransformerBlock(nn.Module):
             attn_mask=attn_mask,
             attn_kwargs=attn_kwargs,
         )
-        image = image + img_gate * img_attn_out
-        text = text + txt_gate * txt_attn_out
+        # addcmul: residual + gate * out — prefer single op over Mul+Add on NPU
+        image = torch.addcmul(image, img_gate, img_attn_out)
+        text = torch.addcmul(text, txt_gate, txt_attn_out)
 
         img_normed_2 = self.img_norm2(image)
         img_modulated_2, img_gate_2 = self._modulate(img_normed_2, img_mod_mlp, modulate_index)
@@ -341,8 +342,8 @@ class QwenImageTransformerBlock(nn.Module):
         img_mlp_out = self.img_mlp(img_modulated_2)
         txt_mlp_out = self.txt_mlp(txt_modulated_2)
 
-        image = image + img_gate_2 * img_mlp_out
-        text = text + txt_gate_2 * txt_mlp_out
+        image = torch.addcmul(image, img_gate_2, img_mlp_out)
+        text = torch.addcmul(text, txt_gate_2, txt_mlp_out)
 
         return text, image
 
