@@ -299,7 +299,8 @@ class QwenImageTransformerBlock(nn.Module):
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
-        return x * (1 + scale_result) + shift_result, gate_result
+        # x*(1+scale)+shift == x + x*scale + shift — prefer addcmul over Adds+Mul+Add
+        return torch.addcmul(x, x, scale_result) + shift_result, gate_result
 
     def forward(
         self,
