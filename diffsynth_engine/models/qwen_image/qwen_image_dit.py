@@ -1,3 +1,8 @@
+import os
+from diffsynth_engine.utils.flag import MINDIE_AVAILABLE
+
+USE_MINDIESD_FUSE = os.environ.get("USE_MINDIESD_FUSE", "0") == "1"
+
 import torch
 import torch.nn as nn
 from typing import Any, Dict, List, Tuple, Union, Optional
@@ -156,6 +161,30 @@ class QwenFeedForward(nn.Module):
 
 
 def apply_rotary_emb_qwen(x: torch.Tensor, freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor]]):
+    if USE_MINDIESD_FUSE and MINDIE_AVAILABLE and x.device.type == "npu":
+        from mindiesd import rotary_position_embedding
+        # Cache expanded cos/sin on the tensor object itself.
+        # Python object identity avoids data_ptr collision across different-length slices.
+        cached = getattr(freqs_cis, '_rope_expanded', None)
+        if cached is None:
+            cos = freqs_cis.real  # (s, d/2)
+            sin = freqs_cis.imag
+            cos = cos.reshape(1, -1, 1, cos.shape[-1])  # (1, S, 1, D/2)
+            sin = sin.reshape(1, -1, 1, sin.shape[-1])
+            cos = cos.unsqueeze(-1).expand(-1, -1, -1, -1, 2).flatten(start_dim=-2)  # (1, S, 1, D)
+            sin = sin.unsqueeze(-1).expand(-1, -1, -1, -1, 2).flatten(start_dim=-2)
+            cos, sin = cos.to(x.device), sin.to(x.device)
+            cached = (cos, sin)
+            freqs_cis._rope_expanded = cached
+        cos, sin = cached
+        output = rotary_position_embedding(
+            x, cos, sin,
+            rotated_mode="rotated_interleaved",
+            head_first=False,
+            fused=True,
+        )
+        return output
+
     x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # (b, s, h, d) -> (b, s, h, d/2, 2)
     x_out = torch.view_as_real(x_rotated * freqs_cis.unsqueeze(1)).flatten(3)  # (b, s, h, d/2, 2) -> (b, s, h, d)
     return x_out.type_as(x)
