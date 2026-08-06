@@ -227,6 +227,7 @@ class QwenDoubleStreamAttention(nn.Module):
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attn_mask: Optional[torch.Tensor] = None,
         attn_kwargs: Optional[Dict[str, Any]] = None,
+        prefetch_fn=None,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         img_q, img_k, img_v = self.to_q(image), self.to_k(image), self.to_v(image)
         txt_q, txt_k, txt_v = self.add_q_proj(text), self.add_k_proj(text), self.add_v_proj(text)
@@ -253,7 +254,9 @@ class QwenDoubleStreamAttention(nn.Module):
         joint_k = torch.cat([txt_k, img_k], dim=1)
         joint_v = torch.cat([txt_v, img_v], dim=1)
 
-        attn_kwargs = attn_kwargs if attn_kwargs is not None else {}
+        attn_kwargs = dict(attn_kwargs) if attn_kwargs is not None else {}
+        if prefetch_fn is not None:
+            attn_kwargs["prefetch_fn"] = prefetch_fn
         joint_attn_out = attention_ops.attention(joint_q, joint_k, joint_v, attn_mask=attn_mask, **attn_kwargs)
 
         joint_attn_out = rearrange(joint_attn_out, "b s h d -> b s (h d)").to(joint_q.dtype)
@@ -356,11 +359,18 @@ class QwenImageTransformerBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         attn_kwargs: Optional[Dict[str, Any]] = None,
         modulate_index: Optional[List[int]] = None,
+        prefetch_fn=None,
+        precomputed_mod=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        img_mod_attn, img_mod_mlp = self.img_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
-        if self.zero_cond_t:
-            temb = torch.chunk(temb, 2, dim=0)[0]
-        txt_mod_attn, txt_mod_mlp = self.txt_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
+        if precomputed_mod is not None:
+            img_mod, txt_mod = precomputed_mod
+            img_mod_attn, img_mod_mlp = img_mod.chunk(2, dim=-1)
+            txt_mod_attn, txt_mod_mlp = txt_mod.chunk(2, dim=-1)
+        else:
+            img_mod_attn, img_mod_mlp = self.img_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
+            if self.zero_cond_t:
+                temb = torch.chunk(temb, 2, dim=0)[0]
+            txt_mod_attn, txt_mod_mlp = self.txt_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
 
         img_modulated, img_gate = self._norm_modulate(self.img_norm1, image, img_mod_attn, modulate_index)
         txt_modulated, txt_gate = self._norm_modulate(self.txt_norm1, text, txt_mod_attn)
@@ -371,6 +381,7 @@ class QwenImageTransformerBlock(nn.Module):
             rotary_emb=rotary_emb,
             attn_mask=attn_mask,
             attn_kwargs=attn_kwargs,
+            prefetch_fn=prefetch_fn,
         )
         # addcmul: residual + gate * out — prefer single op over Mul+Add on NPU
         image = torch.addcmul(image, img_gate, img_attn_out)
@@ -386,6 +397,13 @@ class QwenImageTransformerBlock(nn.Module):
         text = torch.addcmul(text, txt_gate_2, txt_mlp_out)
 
         return text, image
+
+    def compute_mod_from_temb(self, temb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Precompute img/txt mod tensors (temb-only) for A2A overlap prefetch."""
+        img_mod = self.img_mod(temb)
+        txt_temb = torch.chunk(temb, 2, dim=0)[0] if self.zero_cond_t else temb
+        txt_mod = self.txt_mod(txt_temb)
+        return img_mod, txt_mod
 
 
 class QwenImageDiT(PreTrainedModel):
@@ -578,7 +596,21 @@ class QwenImageDiT(PreTrainedModel):
             img_freqs, txt_freqs = rotary_emb
             with sequence_parallel((image, text, img_freqs, txt_freqs, modulate_index), seq_dims=(1, 1, 0, 0, 1)):
                 rotary_emb = (img_freqs, txt_freqs)
-                for block in self.transformer_blocks:
+                from diffsynth_engine.utils.npu_ulysses_a2a import a2a_overlap_enabled
+
+                blocks = self.transformer_blocks
+                prefetched = None
+                for i, block in enumerate(blocks):
+                    prefetch_fn = None
+                    holder = {"mod": None}
+                    if a2a_overlap_enabled() and i + 1 < len(blocks):
+                        next_block = blocks[i + 1]
+
+                        def _prefetch(nb=next_block, h=holder):
+                            h["mod"] = nb.compute_mod_from_temb(conditioning)
+
+                        prefetch_fn = _prefetch
+
                     text, image = block(
                         image=image,
                         text=text,
@@ -587,7 +619,10 @@ class QwenImageDiT(PreTrainedModel):
                         attn_mask=attn_mask,
                         attn_kwargs=attn_kwargs,
                         modulate_index=modulate_index,
+                        prefetch_fn=prefetch_fn,
+                        precomputed_mod=prefetched,
                     )
+                    prefetched = holder["mod"] if prefetch_fn is not None else None
                 if self.zero_cond_t:
                     conditioning = conditioning.chunk(2, dim=0)[0]
                 image = self.norm_out(image, conditioning)

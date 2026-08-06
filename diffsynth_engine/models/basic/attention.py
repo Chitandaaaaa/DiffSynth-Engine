@@ -355,10 +355,16 @@ def _npu_ulysses_mindie_attention(
     v: torch.Tensor,
     attn_mask: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
+    prefetch_fn=None,
 ):
-    """Ulysses SP on NPU: SeqAllToAll4D + MindIE local attn. ring_degree>1 not supported."""
-    from yunchang.comm.all_to_all import SeqAllToAll4D
+    """Ulysses SP on NPU: SeqAllToAll4D + MindIE local attn. ring_degree>1 not supported.
 
+    Optional env:
+      USE_NPU_A2A_SLIM=1 / USE_NPU_A2A_OVERLAP=1 — see diffsynth_engine.utils.npu_ulysses_a2a
+    When OVERLAP is on, runs out-A2A on a side stream and calls prefetch_fn before wait
+    (prefetch must not read ``out``).
+    """
+    from diffsynth_engine.utils.npu_ulysses_a2a import a2a_overlap_enabled, seq_all_to_all_4d
     from diffsynth_engine.utils.process_group import get_sp_ring_world_size, get_sp_ulysses_group
 
     if q.device.type != "npu":
@@ -377,13 +383,22 @@ def _npu_ulysses_mindie_attention(
     # scatter heads (dim=2), gather sequence (dim=1) — same as video_sparse / v1 USP
     scatter_idx, gather_idx = 2, 1
     group = get_sp_ulysses_group()
-    q = SeqAllToAll4D.apply(group, q, scatter_idx, gather_idx)
-    k = SeqAllToAll4D.apply(group, k, scatter_idx, gather_idx)
-    v = SeqAllToAll4D.apply(group, v, scatter_idx, gather_idx)
+    q, _ = seq_all_to_all_4d(group, q, scatter_idx, gather_idx)
+    k, _ = seq_all_to_all_4d(group, k, scatter_idx, gather_idx)
+    v, _ = seq_all_to_all_4d(group, v, scatter_idx, gather_idx)
 
     # Must not call attention() here — it is patched to long_context_attention under SP.
     out = mindie_attn(q, k, v, attn_mask=attn_mask, scale=scale)
-    out = SeqAllToAll4D.apply(group, out, gather_idx, scatter_idx)
+
+    if a2a_overlap_enabled():
+        out, wait_fn = seq_all_to_all_4d(group, out, gather_idx, scatter_idx, async_op=True)
+        if prefetch_fn is not None:
+            prefetch_fn()
+        if wait_fn is not None:
+            wait_fn()
+        return out
+
+    out, _ = seq_all_to_all_4d(group, out, gather_idx, scatter_idx)
     return out
 
 
@@ -424,7 +439,9 @@ def long_context_attention(
     if attn_impl is None or attn_impl == "auto":
         # NPU has no FA/yunchang TORCH_EFFICIENT kernel; pick MindIE Ulysses when available.
         if q.device.type == "npu" and MINDIE_AVAILABLE:
-            return _npu_ulysses_mindie_attention(q, k, v, attn_mask=attn_mask, scale=scale)
+            return _npu_ulysses_mindie_attention(
+                q, k, v, attn_mask=attn_mask, scale=scale, prefetch_fn=kwargs.get("prefetch_fn")
+            )
         if FLASH_ATTN_3_AVAILABLE:
             if flash_attn3_compatible:
                 return LongContextAttention(attn_type=AttnType.FA3)(q, k, v, softmax_scale=scale)
@@ -446,7 +463,9 @@ def long_context_attention(
         raise ValueError("No available long context attention implementation")
     else:
         if attn_impl == "mindie":
-            return _npu_ulysses_mindie_attention(q, k, v, attn_mask=attn_mask, scale=scale)
+            return _npu_ulysses_mindie_attention(
+                q, k, v, attn_mask=attn_mask, scale=scale, prefetch_fn=kwargs.get("prefetch_fn")
+            )
         if attn_impl == "fa3" or attn_impl == "fa3_fp8":
             if not flash_attn3_compatible:
                 raise RuntimeError(
