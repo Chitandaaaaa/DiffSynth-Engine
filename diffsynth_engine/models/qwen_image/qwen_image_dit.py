@@ -148,6 +148,7 @@ class QwenFeedForward(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
+        dim_out = dim if dim_out is None else dim_out
         inner_dim = int(dim * 4)
         self.net = nn.ModuleList([])
         self.net.append(GELU(dim, inner_dim, approximate="tanh", device=device, dtype=dtype))
@@ -155,6 +156,27 @@ class QwenFeedForward(nn.Module):
         self.net.append(nn.Linear(inner_dim, dim_out, device=device, dtype=dtype))
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        # Fuse fc1 + GELU + fc2 via torch_npu.npu_ffn when MindIE fuse path is enabled.
+        if (
+            USE_MINDIESD_FUSE
+            and MINDIE_AVAILABLE
+            and hidden_states.device.type == "npu"
+            and not self.training
+        ):
+            import torch_npu
+
+            fc1 = self.net[0].proj
+            fc2 = self.net[2]
+            # npu_ffn weight layout is [K, N] (in, out); nn.Linear.weight is [out, in].
+            return torch_npu.npu_ffn(
+                hidden_states,
+                fc1.weight.t().contiguous(),
+                fc2.weight.t().contiguous(),
+                "gelu",
+                bias1=fc1.bias,
+                bias2=fc2.bias,
+            )
+
         for module in self.net:
             hidden_states = module(hidden_states)
         return hidden_states
