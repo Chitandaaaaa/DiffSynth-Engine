@@ -168,13 +168,14 @@ class QwenFeedForward(nn.Module):
             fc1 = self.net[0].proj
             fc2 = self.net[2]
             # npu_ffn weight layout is [K, N] (in, out); nn.Linear.weight is [out, in].
+            # BF16 path requires bias in FP32 (acl: bias1 not implemented for DT_BFLOAT16).
             return torch_npu.npu_ffn(
                 hidden_states,
                 fc1.weight.t().contiguous(),
                 fc2.weight.t().contiguous(),
                 "gelu",
-                bias1=fc1.bias,
-                bias2=fc2.bias,
+                bias1=None if fc1.bias is None else fc1.bias.float(),
+                bias2=None if fc2.bias is None else fc2.bias.float(),
             )
 
         for module in self.net:
