@@ -309,7 +309,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_mlp = QwenFeedForward(dim=dim, dim_out=dim, device=device, dtype=dtype)
         self.zero_cond_t = zero_cond_t
 
-    def _modulate(self, x, mod_params, index=None):
+    def _split_mod_params(self, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
             actual_batch = shift.size(0) // 2
@@ -329,8 +329,23 @@ class QwenImageTransformerBlock(nn.Module):
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
+        return shift_result, scale_result, gate_result
+
+    def _modulate(self, x, mod_params, index=None):
+        shift_result, scale_result, gate_result = self._split_mod_params(mod_params, index)
         # x*(1+scale)+shift == x + x*scale + shift — prefer addcmul over Adds+Mul+Add
         return torch.addcmul(x, x, scale_result) + shift_result, gate_result
+
+    def _norm_modulate(self, norm: nn.LayerNorm, x: torch.Tensor, mod_params, index=None):
+        """LayerNorm + Ada modulate. Fuses via mindiesd.layernorm_scale_shift when enabled."""
+        if USE_MINDIESD_FUSE and MINDIE_AVAILABLE and x.device.type == "npu":
+            from mindiesd import layernorm_scale_shift
+
+            shift_result, scale_result, gate_result = self._split_mod_params(mod_params, index)
+            # out = LN(x) * (1 + scale) + shift; gate stays separate for residual.
+            out = layernorm_scale_shift(norm, x, scale_result, shift_result, fused=True)
+            return out, gate_result
+        return self._modulate(norm(x), mod_params, index)
 
     def forward(
         self,
@@ -347,11 +362,8 @@ class QwenImageTransformerBlock(nn.Module):
             temb = torch.chunk(temb, 2, dim=0)[0]
         txt_mod_attn, txt_mod_mlp = self.txt_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
 
-        img_normed = self.img_norm1(image)
-        img_modulated, img_gate = self._modulate(img_normed, img_mod_attn, modulate_index)
-
-        txt_normed = self.txt_norm1(text)
-        txt_modulated, txt_gate = self._modulate(txt_normed, txt_mod_attn)
+        img_modulated, img_gate = self._norm_modulate(self.img_norm1, image, img_mod_attn, modulate_index)
+        txt_modulated, txt_gate = self._norm_modulate(self.txt_norm1, text, txt_mod_attn)
 
         img_attn_out, txt_attn_out = self.attn(
             image=img_modulated,
@@ -364,11 +376,8 @@ class QwenImageTransformerBlock(nn.Module):
         image = torch.addcmul(image, img_gate, img_attn_out)
         text = torch.addcmul(text, txt_gate, txt_attn_out)
 
-        img_normed_2 = self.img_norm2(image)
-        img_modulated_2, img_gate_2 = self._modulate(img_normed_2, img_mod_mlp, modulate_index)
-
-        txt_normed_2 = self.txt_norm2(text)
-        txt_modulated_2, txt_gate_2 = self._modulate(txt_normed_2, txt_mod_mlp)
+        img_modulated_2, img_gate_2 = self._norm_modulate(self.img_norm2, image, img_mod_mlp, modulate_index)
+        txt_modulated_2, txt_gate_2 = self._norm_modulate(self.txt_norm2, text, txt_mod_mlp)
 
         img_mlp_out = self.img_mlp(img_modulated_2)
         txt_mlp_out = self.txt_mlp(txt_modulated_2)
