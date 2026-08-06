@@ -2,6 +2,8 @@ import os
 from diffsynth_engine.utils.flag import MINDIE_AVAILABLE
 
 USE_MINDIESD_FUSE = os.environ.get("USE_MINDIESD_FUSE", "0") == "1"
+# Set True after npu_ffn fails once (e.g. kernel unsupported on this CANN/chip).
+_NPU_FFN_UNAVAILABLE = False
 
 import torch
 import torch.nn as nn
@@ -15,12 +17,15 @@ from diffsynth_engine.models.basic.timestep import TimestepEmbeddings
 from diffsynth_engine.models.basic.transformer_helper import AdaLayerNorm, GELU, RMSNorm
 from diffsynth_engine.utils.gguf import gguf_inference
 from diffsynth_engine.utils.fp8_linear import fp8_inference
+from diffsynth_engine.utils import logging
 from diffsynth_engine.utils.parallel import (
     cfg_parallel,
     cfg_parallel_unshard,
     sequence_parallel,
     sequence_parallel_unshard,
 )
+
+logger = logging.get_logger(__name__)
 
 
 class QwenImageDiTStateDictConverter(StateDictConverter):
@@ -157,9 +162,11 @@ class QwenFeedForward(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         # Fuse fc1 + GELU + fc2 via torch_npu.npu_ffn when MindIE fuse path is enabled.
+        global _NPU_FFN_UNAVAILABLE
         if (
             USE_MINDIESD_FUSE
             and MINDIE_AVAILABLE
+            and not _NPU_FFN_UNAVAILABLE
             and hidden_states.device.type == "npu"
             and not self.training
         ):
@@ -167,16 +174,28 @@ class QwenFeedForward(nn.Module):
 
             fc1 = self.net[0].proj
             fc2 = self.net[2]
-            # npu_ffn weight layout is [K, N] (in, out); nn.Linear.weight is [out, in].
+            # npu_ffn docs use 2D [M, K]; keep leading dims via reshape.
+            # weight layout [K, N] (in, out); nn.Linear.weight is [out, in].
             # BF16 path requires bias in FP32 (acl: bias1 not implemented for DT_BFLOAT16).
-            return torch_npu.npu_ffn(
-                hidden_states,
-                fc1.weight.t().contiguous(),
-                fc2.weight.t().contiguous(),
-                "gelu",
-                bias1=None if fc1.bias is None else fc1.bias.float(),
-                bias2=None if fc2.bias is None else fc2.bias.float(),
-            )
+            orig_shape = hidden_states.shape
+            x_2d = hidden_states.reshape(-1, orig_shape[-1]).contiguous()
+            try:
+                out_2d = torch_npu.npu_ffn(
+                    x_2d,
+                    fc1.weight.t().contiguous(),
+                    fc2.weight.t().contiguous(),
+                    "gelu",
+                    bias1=None if fc1.bias is None else fc1.bias.float(),
+                    bias2=None if fc2.bias is None else fc2.bias.float(),
+                )
+                return out_2d.reshape(orig_shape)
+            except RuntimeError as e:
+                _NPU_FFN_UNAVAILABLE = True
+                logger.warning(
+                    "npu_ffn unavailable on this device/CANN (%s); "
+                    "falling back to eager MLP for the rest of the process",
+                    e,
+                )
 
         for module in self.net:
             hidden_states = module(hidden_states)
