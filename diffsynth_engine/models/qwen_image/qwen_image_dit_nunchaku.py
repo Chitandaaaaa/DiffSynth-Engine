@@ -54,7 +54,6 @@ class QwenDoubleStreamAttentionNunchaku(QwenDoubleStreamAttention):
         rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attn_mask: Optional[torch.Tensor] = None,
         attn_kwargs: Optional[Dict[str, Any]] = None,
-        prefetch_fn=None,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         img_q, img_k, img_v = self.to_qkv(image).chunk(3, dim=-1)
         txt_q, txt_k, txt_v = self.add_qkv_proj(text).chunk(3, dim=-1)
@@ -81,9 +80,7 @@ class QwenDoubleStreamAttentionNunchaku(QwenDoubleStreamAttention):
         joint_k = torch.cat([txt_k, img_k], dim=1)
         joint_v = torch.cat([txt_v, img_v], dim=1)
 
-        attn_kwargs = dict(attn_kwargs) if attn_kwargs is not None else {}
-        if prefetch_fn is not None:
-            attn_kwargs["prefetch_fn"] = prefetch_fn
+        attn_kwargs = attn_kwargs if attn_kwargs is not None else {}
         joint_attn_out = attention_ops.attention(joint_q, joint_k, joint_v, attn_mask=attn_mask, **attn_kwargs)
 
         joint_attn_out = rearrange(joint_attn_out, "b s h d -> b s (h d)").to(joint_q.dtype)
@@ -183,8 +180,6 @@ class QwenImageTransformerBlockNunchaku(QwenImageTransformerBlock):
         attn_mask: Optional[torch.Tensor] = None,
         attn_kwargs: Optional[Dict[str, Any]] = None,
         modulate_index: Optional[List[int]] = None,
-        prefetch_fn=None,
-        precomputed_mod=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.use_nunchaku_awq:
             img_mod_params = self.img_mod(temb)  # [B, 6*dim]
@@ -216,7 +211,6 @@ class QwenImageTransformerBlockNunchaku(QwenImageTransformerBlock):
             rotary_emb=rotary_emb,
             attn_mask=attn_mask,
             attn_kwargs=attn_kwargs,
-            prefetch_fn=prefetch_fn,
         )
 
         image = image + img_gate * img_attn_out
