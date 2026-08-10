@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +21,7 @@ from diffsynth_engine.utils.flag import (
 from diffsynth_engine.utils.platform import DTYPE_FP8
 
 FA3_MAX_HEADDIM = 256
+USE_MINDIESD_FUSE = os.environ.get("USE_MINDIESD_FUSE", "0") == "1"
 
 logger = logging.get_logger(__name__)
 
@@ -110,21 +112,38 @@ if VIDEO_SPARSE_ATTN_AVAILABLE:
 
 if MINDIE_AVAILABLE:
     from mindiesd.layers.flash_attn.attention_forward import attention_forward
+    from mindiesd import sparse_attention
 
     def mindie_attn(q, k, v, attn_mask=None, scale=None):
-        #return attention_forward(
-        #    query=q, key=k, value=v,
-        #   attn_mask=attn_mask, scale=scale,
-        #    fused=True, head_first=False,
-        #)
-
         return attention_forward(
-            query=q, key=k, value=v,
-            attn_mask=attn_mask, scale=scale,
-            fused=True, head_first=False,
+            query=q,
+            key=k,
+            value=v,
+            attn_mask=attn_mask,
+            scale=scale,
+            fused=True,
+            head_first=False,
             opt_mode="manual",
             op_type="fused_attn_score",
             layout="BSND",
+        )
+
+    def mindie_sparse_attn(q, k, v, attn_mask=None, scale=None, **kwargs):
+        # DiffSynth q/k/v layout: [B, S, N, D]
+        return sparse_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            scale=scale,
+            head_num=q.shape[2],
+            input_layout="BSND",
+            sparse_type=kwargs.get("sparse_type", "rf_v3"),
+            inner_precise=kwargs.get("inner_precise", 4),
+            sparsity=kwargs.get("sparsity", 0.8),
+            txt_len=kwargs.get("txt_len", 0),
+            latent_shape_q=kwargs.get("latent_shape_q"),
+            latent_shape_k=kwargs.get("latent_shape_k"),
         )
 
 
@@ -275,6 +294,8 @@ def attention(
         if attn_impl == "sage":
             return sage_attn(q, k, v, attn_mask=attn_mask, scale=scale)
         if attn_impl == "sparge":
+            if USE_MINDIESD_FUSE and MINDIE_AVAILABLE:
+                return mindie_sparse_attn(q, k, v, attn_mask=attn_mask, scale=scale, **kwargs)
             return sparge_attn(
                 q,
                 k,
@@ -387,6 +408,43 @@ def _npu_ulysses_mindie_attention(
     return out
 
 
+def _npu_ulysses_mindie_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    **kwargs,
+):
+    """Ulysses SP on NPU: SeqAllToAll4D + MindIE sparse local attn."""
+    from yunchang.comm.all_to_all import SeqAllToAll4D
+
+    from diffsynth_engine.utils.process_group import get_sp_ring_world_size, get_sp_ulysses_group
+
+    if q.device.type != "npu":
+        raise RuntimeError("mindie sparse long-context attention is only supported on NPU")
+    if not MINDIE_AVAILABLE:
+        raise RuntimeError(
+            "NPU Ulysses sequence parallel requires MindIE sparse attention, but MindIE-SD is not available"
+        )
+    if get_sp_ring_world_size() > 1:
+        raise RuntimeError(
+            "NPU long-context attention currently supports Ulysses only "
+            f"(sp_ring_degree must be 1, got {get_sp_ring_world_size()})"
+        )
+    assert attn_mask is None, "long context attention does not support attention mask"
+
+    scatter_idx, gather_idx = 2, 1
+    group = get_sp_ulysses_group()
+    q = SeqAllToAll4D.apply(group, q, scatter_idx, gather_idx)
+    k = SeqAllToAll4D.apply(group, k, scatter_idx, gather_idx)
+    v = SeqAllToAll4D.apply(group, v, scatter_idx, gather_idx)
+
+    out = mindie_sparse_attn(q, k, v, attn_mask=attn_mask, scale=scale, **kwargs)
+    out = SeqAllToAll4D.apply(group, out, gather_idx, scatter_idx)
+    return out
+
+
 def long_context_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -482,6 +540,8 @@ def long_context_attention(
         if attn_impl == "sage":
             return LongContextAttention(attn_type=AttnType.SAGE_AUTO)(q, k, v, softmax_scale=scale)
         if attn_impl == "sparge":
+            if USE_MINDIESD_FUSE and MINDIE_AVAILABLE:
+                return _npu_ulysses_mindie_sparse_attention(q, k, v, attn_mask=attn_mask, scale=scale, **kwargs)
             attn_processor = SparseAttentionMeansim()
             # default args from spas_sage2_attn_meansim_cuda
             attn_processor.smooth_k = torch.tensor(kwargs.get("smooth_k", True))
