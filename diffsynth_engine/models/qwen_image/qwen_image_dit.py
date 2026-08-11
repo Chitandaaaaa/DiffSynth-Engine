@@ -2,9 +2,6 @@ import os
 from diffsynth_engine.utils.flag import MINDIE_AVAILABLE
 
 USE_MINDIESD_FUSE = os.environ.get("USE_MINDIESD_FUSE", "0") == "1"
-# Print fc1/GELU/fc2 tensor stats for the first N MLP forwards (img or txt).
-DEBUG_QWEN_MLP = int(os.environ.get("DEBUG_QWEN_MLP", "0"))
-_DEBUG_QWEN_MLP_LEFT = DEBUG_QWEN_MLP
 
 import torch
 import torch.nn as nn
@@ -18,48 +15,12 @@ from diffsynth_engine.models.basic.timestep import TimestepEmbeddings
 from diffsynth_engine.models.basic.transformer_helper import AdaLayerNorm, GELU, RMSNorm
 from diffsynth_engine.utils.gguf import gguf_inference
 from diffsynth_engine.utils.fp8_linear import fp8_inference
-from diffsynth_engine.utils import logging
 from diffsynth_engine.utils.parallel import (
     cfg_parallel,
     cfg_parallel_unshard,
     sequence_parallel,
     sequence_parallel_unshard,
 )
-
-logger = logging.get_logger(__name__)
-
-
-def _tensor_debug_stats(name: str, t: torch.Tensor) -> None:
-    if t.device.type == "npu":
-        torch.npu.synchronize()
-    x = t.detach().float()
-    flat = x.reshape(-1)
-    n = flat.numel()
-    abs_x = flat.abs()
-    # sample a few values without dumping the whole tensor
-    sample_idx = [0, 1, 2, max(n // 2, 0), max(n - 3, 0), max(n - 2, 0), max(n - 1, 0)]
-    sample_idx = sorted(set(i for i in sample_idx if i < n))
-    sample = flat[sample_idx].tolist()
-    logger.warning(
-        "[DEBUG_QWEN_MLP] %s shape=%s dtype=%s device=%s "
-        "all_zero=%s has_nan=%s has_inf=%s "
-        "min=%.6g max=%.6g mean=%.6g abs_mean=%.6g abs_max=%.6g "
-        "sample_idx=%s sample=%s",
-        name,
-        tuple(t.shape),
-        t.dtype,
-        t.device,
-        bool((flat == 0).all().item()),
-        bool(torch.isnan(flat).any().item()),
-        bool(torch.isinf(flat).any().item()),
-        flat.min().item(),
-        flat.max().item(),
-        flat.mean().item(),
-        abs_x.mean().item(),
-        abs_x.max().item(),
-        sample_idx,
-        sample,
-    )
 
 
 class QwenImageDiTStateDictConverter(StateDictConverter):
@@ -195,32 +156,6 @@ class QwenFeedForward(nn.Module):
         self.net.append(nn.Linear(inner_dim, dim_out, device=device, dtype=dtype))
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        global _DEBUG_QWEN_MLP_LEFT
-        if _DEBUG_QWEN_MLP_LEFT > 0:
-            _DEBUG_QWEN_MLP_LEFT -= 1
-            # Split GELU into proj(MatMul) + gelu so we can inspect both MatMul outputs.
-            gelu_mod: GELU = self.net[0]
-            fc1 = gelu_mod.proj
-            fc2 = self.net[2]
-            fc1_out = fc1(hidden_states)
-            gelu_out = gelu_mod.gelu(fc1_out)
-            drop_out = self.net[1](gelu_out)
-            fc2_out = fc2(drop_out)
-            tag = f"call#{DEBUG_QWEN_MLP - _DEBUG_QWEN_MLP_LEFT}"
-            _tensor_debug_stats(f"{tag} input", hidden_states)
-            if fc1.bias is None:
-                logger.warning("[DEBUG_QWEN_MLP] %s fc1.bias=None", tag)
-            else:
-                _tensor_debug_stats(f"{tag} fc1.bias", fc1.bias)
-            _tensor_debug_stats(f"{tag} fc1(MatMul#18-ish)", fc1_out)
-            _tensor_debug_stats(f"{tag} gelu", gelu_out)
-            if fc2.bias is None:
-                logger.warning("[DEBUG_QWEN_MLP] %s fc2.bias=None", tag)
-            else:
-                _tensor_debug_stats(f"{tag} fc2.bias", fc2.bias)
-            _tensor_debug_stats(f"{tag} fc2(MatMul#20-ish)", fc2_out)
-            return fc2_out
-
         for module in self.net:
             hidden_states = module(hidden_states)
         return hidden_states
