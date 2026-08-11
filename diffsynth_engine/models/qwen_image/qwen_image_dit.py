@@ -200,14 +200,24 @@ class QwenFeedForward(nn.Module):
             _DEBUG_QWEN_MLP_LEFT -= 1
             # Split GELU into proj(MatMul) + gelu so we can inspect both MatMul outputs.
             gelu_mod: GELU = self.net[0]
-            fc1_out = gelu_mod.proj(hidden_states)
+            fc1 = gelu_mod.proj
+            fc2 = self.net[2]
+            fc1_out = fc1(hidden_states)
             gelu_out = gelu_mod.gelu(fc1_out)
             drop_out = self.net[1](gelu_out)
-            fc2_out = self.net[2](drop_out)
+            fc2_out = fc2(drop_out)
             tag = f"call#{DEBUG_QWEN_MLP - _DEBUG_QWEN_MLP_LEFT}"
             _tensor_debug_stats(f"{tag} input", hidden_states)
+            if fc1.bias is None:
+                logger.warning("[DEBUG_QWEN_MLP] %s fc1.bias=None", tag)
+            else:
+                _tensor_debug_stats(f"{tag} fc1.bias", fc1.bias)
             _tensor_debug_stats(f"{tag} fc1(MatMul#18-ish)", fc1_out)
             _tensor_debug_stats(f"{tag} gelu", gelu_out)
+            if fc2.bias is None:
+                logger.warning("[DEBUG_QWEN_MLP] %s fc2.bias=None", tag)
+            else:
+                _tensor_debug_stats(f"{tag} fc2.bias", fc2.bias)
             _tensor_debug_stats(f"{tag} fc2(MatMul#20-ish)", fc2_out)
             return fc2_out
 
