@@ -128,14 +128,42 @@ if MINDIE_AVAILABLE:
             layout="BSND",
         )
 
+    def _rf_v3_latent_shape(seq_len: int):
+        """Pick (t,h,w) with h,w divisible by 8 for RainFusion's aligned rearrange path.
+
+        [1,1,S] satisfies t*h*w==S but hits the h%8!=0 branch and crashes on split_size=0.
+        """
+        if seq_len % 64 == 0:
+            return [1, 8, seq_len // 8]
+        for t in range(1, seq_len // 64 + 1):
+            if seq_len % t != 0:
+                continue
+            plane = seq_len // t
+            for h in range(8, plane + 1, 8):
+                if plane % h != 0:
+                    continue
+                w = plane // h
+                if w % 8 == 0:
+                    return [t, h, w]
+        return None
+
     def mindie_sparse_attn(q, k, v, attn_mask=None, scale=None, **kwargs):
         # DiffSynth q/k/v layout: [B, S, N, D]
         # A5 rf_v3 currently supports txt_len=0 only (vision-oriented API).
-        # Qwen joint / edit attention is [txt|img|...]; a single true (t,h,w) is unavailable,
-        # so use degenerate [1, 1, S] to satisfy t*h*w == S and keep the call runnable.
+        # Qwen joint / edit lacks a single true spatial (t,h,w); pick an 8-aligned
+        # degenerate layout (pad seq to multiple of 64 when needed).
         seq_len = q.shape[1]
-        latent_shape = [1, 1, seq_len]
-        return sparse_attention(
+        latent_shape = _rf_v3_latent_shape(seq_len)
+        pad_len = 0
+        if latent_shape is None:
+            pad_len = (64 - seq_len % 64) % 64
+            if pad_len:
+                # F.pad pads from the last dim: D, N, S
+                q = F.pad(q, (0, 0, 0, 0, 0, pad_len))
+                k = F.pad(k, (0, 0, 0, 0, 0, pad_len))
+                v = F.pad(v, (0, 0, 0, 0, 0, pad_len))
+            latent_shape = [1, 8, (seq_len + pad_len) // 8]
+        out = sparse_attention(
             q,
             k,
             v,
@@ -150,6 +178,9 @@ if MINDIE_AVAILABLE:
             latent_shape_q=latent_shape,
             latent_shape_k=latent_shape,
         )
+        if pad_len:
+            out = out[:, :seq_len]
+        return out
 
 
 def eager_attn(q, k, v, attn_mask=None, scale=None):
