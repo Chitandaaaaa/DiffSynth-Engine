@@ -130,6 +130,11 @@ if MINDIE_AVAILABLE:
 
     def mindie_sparse_attn(q, k, v, attn_mask=None, scale=None, **kwargs):
         # DiffSynth q/k/v layout: [B, S, N, D]
+        # A5 rf_v3 currently supports txt_len=0 only (vision-oriented API).
+        # Qwen joint / edit attention is [txt|img|...]; a single true (t,h,w) is unavailable,
+        # so use degenerate [1, 1, S] to satisfy t*h*w == S and keep the call runnable.
+        seq_len = q.shape[1]
+        latent_shape = [1, 1, seq_len]
         return sparse_attention(
             q,
             k,
@@ -141,9 +146,9 @@ if MINDIE_AVAILABLE:
             sparse_type=kwargs.get("sparse_type", "rf_v3"),
             inner_precise=kwargs.get("inner_precise", 4),
             sparsity=kwargs.get("sparsity", 0.8),
-            txt_len=kwargs.get("txt_len", 0),
-            latent_shape_q=kwargs.get("latent_shape_q"),
-            latent_shape_k=kwargs.get("latent_shape_k"),
+            txt_len=0,
+            latent_shape_q=latent_shape,
+            latent_shape_k=latent_shape,
         )
 
 
