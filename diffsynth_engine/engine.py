@@ -32,6 +32,9 @@ class DiffSynthEngine:
     def generate(self, **kwargs):
         raise NotImplementedError
 
+    def run_dit_mock_denoise(self, **kwargs):
+        raise NotImplementedError
+
     def shutdown(self):
         raise NotImplementedError
 
@@ -173,6 +176,9 @@ class LocalEngine(DiffSynthEngine):
     def generate(self, **kwargs):
         return self.pipeline(**kwargs)
 
+    def run_dit_mock_denoise(self, **kwargs):
+        return self.pipeline.run_dit_mock_denoise(**kwargs)
+
     def shutdown(self):
         if self.pipeline is not None:
             del self.pipeline
@@ -300,6 +306,9 @@ class DistributedEngine(DiffSynthEngine):
 
     def generate(self, **kwargs):
         return self._dispatch("__call__", output_rank=0, **kwargs)
+
+    def run_dit_mock_denoise(self, **kwargs):
+        return self._dispatch("run_dit_mock_denoise", output_rank=0, **kwargs)
 
     def load_loras(self, lora_args: dict[str, Any] | list[dict[str, Any]]) -> list[str]:
         return self._dispatch("load_loras", lora_args=lora_args)

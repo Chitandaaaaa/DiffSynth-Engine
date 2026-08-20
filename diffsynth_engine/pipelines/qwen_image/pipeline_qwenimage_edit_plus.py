@@ -146,6 +146,44 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 
+def _align_up(value: int, align: int) -> int:
+    if align <= 1:
+        return value
+    return (value + align - 1) // align * align
+
+
+def _factor_hw(seq_len: int, max_axis: int = 4096) -> Optional[tuple[int, int]]:
+    """Find H, W <= max_axis such that H * W == seq_len."""
+    if seq_len <= 0:
+        return None
+    upper = min(max_axis, seq_len)
+    for height in range(1, upper + 1):
+        if seq_len % height == 0:
+            width = seq_len // height
+            if width <= max_axis:
+                return height, width
+    return None
+
+
+def _choose_hw_for_seq(seq_len: int, sp_align: int = 1, max_axis: int = 4096) -> tuple[int, int, int]:
+    """Pad seq_len until it factors into (H, W) with each axis <= max_axis.
+
+    Returns:
+        Tuple[int, int, int]: (padded_seq_len, height, width)
+    """
+    candidate = _align_up(max(seq_len, 1), sp_align)
+    # Bound the search: worst case we scan a few thousand aligned lengths.
+    max_search = candidate + max_axis * sp_align
+    while candidate <= max_search:
+        hw = _factor_hw(candidate, max_axis=max_axis)
+        if hw is not None:
+            return candidate, hw[0], hw[1]
+        candidate += max(sp_align, 1)
+    raise ValueError(
+        f"Cannot factor sequence length {seq_len} into H,W <= {max_axis} (sp_align={sp_align})"
+    )
+
+
 class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
     r"""
     The Qwen-Image-Edit-Plus pipeline for image editing with simplified multi-image support.
@@ -673,6 +711,193 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
         noise_norm = torch.norm(comb_pred.float(), dim=-1, keepdim=True)
         noise_pred = (comb_pred.float() * (cond_norm / noise_norm)).to(original_dtype)
         return noise_pred
+
+    def _packed_latent_len(self, height: int, width: int) -> tuple[int, tuple[int, int, int]]:
+        """Packed DiT token length and RoPE img_shape for an RGB resolution."""
+        packed_h = 2 * (int(height) // (self.vae_scale_factor * 2))
+        packed_w = 2 * (int(width) // (self.vae_scale_factor * 2))
+        latents_len = (packed_h // 2) * (packed_w // 2)
+        img_shape = (1, height // self.vae_scale_factor // 2, width // self.vae_scale_factor // 2)
+        if math.prod(img_shape) != latents_len:
+            raise ValueError(
+                f"img_shape {img_shape} prod={math.prod(img_shape)} != packed latents_len={latents_len} "
+                f"for resolution {width}x{height}"
+            )
+        return latents_len, img_shape
+
+    @torch.no_grad()
+    def run_dit_mock_denoise(
+        self,
+        total_seq_len: int,
+        height: int = 720,
+        width: int = 1280,
+        text_seq_len: int = 512,
+        num_inference_steps: int = 10,
+        true_cfg_scale: float = 4.0,
+        seed: int = 1,
+    ) -> Dict[str, Any]:
+        """Run only the DiT denoising loop with mock long-sequence tensors.
+
+        Joint attention length is:
+            total_seq_len ≈ text_seq_len + latents_len + image_latents_len
+        where ``latents_len`` is derived from ``width`` x ``height`` (packed).
+        Remaining tokens go to ``image_latents`` (and a short text stream).
+        VAE encode/decode and the VL text encoder are skipped.
+        """
+        if total_seq_len <= 0:
+            raise ValueError(f"total_seq_len must be positive, got {total_seq_len}")
+        if text_seq_len <= 0:
+            raise ValueError(f"text_seq_len must be positive, got {text_seq_len}")
+        if num_inference_steps < 1:
+            raise ValueError(f"num_inference_steps must be >= 1, got {num_inference_steps}")
+
+        sp_align = max(
+            1,
+            (self.pipeline_config.sp_ulysses_degree or 1) * (self.pipeline_config.sp_ring_degree or 1),
+        )
+        latents_len, latents_shape = self._packed_latent_len(height, width)
+        text_len = _align_up(text_seq_len, sp_align)
+        remain = total_seq_len - latents_len - text_len
+        if remain <= 0:
+            raise ValueError(
+                f"total_seq_len={total_seq_len} is too small for latents_len={latents_len} "
+                f"and text_seq_len={text_len} (aligned from {text_seq_len})"
+            )
+
+        image_latents_len, image_h, image_w = _choose_hw_for_seq(remain, sp_align=sp_align)
+        joint_seq_len = text_len + latents_len + image_latents_len
+        img_shapes = [[latents_shape, (1, image_h, image_w)]]
+
+        rope_max_axis = 4096
+        max_vid_index = 0
+        for frame, shape_h, shape_w in img_shapes[0]:
+            if frame > rope_max_axis or shape_h > rope_max_axis or shape_w > rope_max_axis:
+                raise ValueError(
+                    f"img_shape {(frame, shape_h, shape_w)} exceeds RoPE cache size {rope_max_axis}"
+                )
+            max_vid_index = max(max_vid_index, shape_h // 2, shape_w // 2)
+        if max_vid_index + text_len > rope_max_axis:
+            raise ValueError(
+                f"text RoPE would overflow: max_vid_index={max_vid_index} + text_len={text_len} "
+                f"> {rope_max_axis}. Reduce text_seq_len or choose a shorter image_latents shape."
+            )
+
+        device = self.device
+        dtype = self.pipeline_config.model_dtype
+        packed_channels = self.transformer.config.in_channels
+        joint_attention_dim = self.transformer.config.joint_attention_dim
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+
+        latents = randn_tensor((1, latents_len, packed_channels), generator=generator, device=device, dtype=dtype)
+        image_latents = randn_tensor(
+            (1, image_latents_len, packed_channels), generator=generator, device=device, dtype=dtype
+        )
+        prompt_embeds = randn_tensor(
+            (1, text_len, joint_attention_dim), generator=generator, device=device, dtype=dtype
+        )
+        prompt_embeds_mask = torch.ones((1, text_len), dtype=torch.long, device=device)
+
+        do_true_cfg = true_cfg_scale > 1
+        if do_true_cfg:
+            negative_prompt_embeds = randn_tensor(
+                (1, text_len, joint_attention_dim), generator=generator, device=device, dtype=dtype
+            )
+            negative_prompt_embeds_mask = torch.ones((1, text_len), dtype=torch.long, device=device)
+        else:
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
+
+        logger.info(
+            "DiT mock denoise: requested_total=%d actual_joint=%d "
+            "text_len=%d latents_len=%d image_latents_len=%d img_shapes=%s "
+            "sp_align=%d cfg=%s steps=%d resolution=%dx%d",
+            total_seq_len,
+            joint_seq_len,
+            text_len,
+            latents_len,
+            image_latents_len,
+            img_shapes,
+            sp_align,
+            do_true_cfg,
+            num_inference_steps,
+            width,
+            height,
+        )
+        if joint_seq_len != total_seq_len:
+            logger.warning(
+                "Padded mock sequence to satisfy H*W factoring / SP align: requested=%d actual=%d",
+                total_seq_len,
+                joint_seq_len,
+            )
+
+        self._attention_kwargs = {}
+        self._current_timestep = None
+        self._interrupt = False
+
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        mu = calculate_shift(
+            latents_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            sigmas=sigmas,
+            mu=mu,
+        )
+        num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        self._num_timesteps = len(timesteps)
+        self.scheduler.set_begin_index(0)
+
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                self._current_timestep = t
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                attn_metadata = self._build_attn_metadata(self.pipeline_config.attn_params)
+                noise_pred = self._predict_noise_with_cfg(
+                    latents=latents,
+                    image_latents=image_latents,
+                    timestep=timestep,
+                    prompt_embeds=prompt_embeds,
+                    prompt_embeds_mask=prompt_embeds_mask,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+                    img_shapes=img_shapes,
+                    attn_metadata=attn_metadata,
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=true_cfg_scale,
+                    use_cfg_parallel=self.pipeline_config.use_cfg_parallel,
+                )
+
+                latents_dtype = latents.dtype
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                if latents.dtype != latents_dtype:
+                    latents = latents.to(latents_dtype)
+
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+        self._current_timestep = None
+        return {
+            "requested_total_seq_len": total_seq_len,
+            "joint_seq_len": joint_seq_len,
+            "text_len": text_len,
+            "latents_len": latents_len,
+            "image_latents_len": image_latents_len,
+            "img_shapes": img_shapes,
+            "height": height,
+            "width": width,
+            "num_inference_steps": num_inference_steps,
+            "true_cfg_scale": true_cfg_scale,
+            "do_true_cfg": do_true_cfg,
+        }
 
     @property
     def attention_kwargs(self):
