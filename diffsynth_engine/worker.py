@@ -64,9 +64,17 @@ class Worker:
         return self.pipeline(**kwargs)
 
     def start_profile(self, **kwargs):
-        path = kwargs.get("path", ".")
-        profile_rank0_only = kwargs.get("profile_rank0_only", True)
-        return TorchProfiler.start(path, profile_rank0_only=profile_rank0_only)
+        path = kwargs.pop("path", ".")
+        profile_rank0_only = kwargs.pop("profile_rank0_only", True)
+        with_stack = kwargs.pop("with_stack", True)
+        profile_ranks = kwargs.pop("profile_ranks", None)
+        return TorchProfiler.start(
+            path,
+            profile_rank0_only=profile_rank0_only,
+            with_stack=with_stack,
+            profile_ranks=profile_ranks,
+            **kwargs,
+        )
 
     def stop_profile(self, **kwargs):
         result = TorchProfiler.stop()
