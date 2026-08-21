@@ -51,6 +51,27 @@ def _npu_experimental_config(torch_npu_mod):
     return ExperimentalConfig()
 
 
+def _make_profiler_schedule(profiler_mod, wait: int, warmup: int, active: int, skip_first: int = 0, repeat: int = 1):
+    """Build wait/warmup/active schedule; try torch_npu then torch.profiler."""
+    schedule_fn = getattr(profiler_mod, "schedule", None)
+    if schedule_fn is None:
+        schedule_fn = torch.profiler.schedule
+    attempts = [
+        dict(wait=wait, warmup=warmup, active=active, repeat=repeat, skip_first=skip_first),
+        dict(wait=wait, warmup=warmup, active=active, repeat=repeat),
+        dict(wait=wait, warmup=warmup, active=active),
+    ]
+    last_error = None
+    for kwargs in attempts:
+        try:
+            return schedule_fn(**kwargs)
+        except TypeError as e:
+            last_error = e
+            continue
+    logger.warning("Failed to build profiler schedule: %s", last_error)
+    return None
+
+
 class TorchProfiler:
     """
     End-to-end profiler.
@@ -66,7 +87,15 @@ class TorchProfiler:
     _backend: str = ""
 
     @classmethod
-    def start(cls, trace_path_template: str, profile_rank0_only: bool = True) -> str:
+    def start(
+        cls,
+        trace_path_template: str,
+        profile_rank0_only: bool = True,
+        wait: int = 0,
+        warmup: int = 0,
+        active: int | None = None,
+        skip_first: int = 0,
+    ) -> str:
         if cls._profiler is not None:
             logger.warning("[Rank %s] Stopping existing profiler", cls._get_rank())
             cls._profiler.stop()
@@ -82,11 +111,23 @@ class TorchProfiler:
             return ""
 
         if _use_npu_profiler():
-            return cls._start_npu(rank, trace_path_template)
-        return cls._start_cuda(rank, trace_path_template)
+            return cls._start_npu(
+                rank, trace_path_template, wait=wait, warmup=warmup, active=active, skip_first=skip_first
+            )
+        return cls._start_cuda(
+            rank, trace_path_template, wait=wait, warmup=warmup, active=active, skip_first=skip_first
+        )
 
     @classmethod
-    def _start_npu(cls, rank: int, trace_path_template: str) -> str:
+    def _start_npu(
+        cls,
+        rank: int,
+        trace_path_template: str,
+        wait: int = 0,
+        warmup: int = 0,
+        active: int | None = None,
+        skip_first: int = 0,
+    ) -> str:
         import torch_npu
 
         rank_dir = os.path.join(trace_path_template, f"rank{rank}")
@@ -107,7 +148,7 @@ class TorchProfiler:
         except TypeError:
             on_trace_ready = torch_npu.profiler.tensorboard_trace_handler(rank_dir)
 
-        cls._profiler = torch_npu.profiler.profile(
+        profile_kwargs = dict(
             activities=[
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU,
@@ -119,17 +160,41 @@ class TorchProfiler:
             with_flops=False,
             experimental_config=experimental_config,
         )
+        if active is not None:
+            schedule = _make_profiler_schedule(
+                torch_npu.profiler, wait=wait, warmup=warmup, active=active, skip_first=skip_first
+            )
+            if schedule is not None:
+                profile_kwargs["schedule"] = schedule
+                logger.info(
+                    "[Rank %s] Profiler schedule wait=%d warmup=%d active=%d skip_first=%d",
+                    rank,
+                    wait,
+                    warmup,
+                    active,
+                    skip_first,
+                )
+        cls._profiler = torch_npu.profiler.profile(**profile_kwargs)
         cls._profiler.start()
         return rank_dir
 
     @classmethod
-    def _start_cuda(cls, rank: int, trace_path_template: str) -> str:
+    def _start_cuda(
+        cls,
+        rank: int,
+        trace_path_template: str,
+        wait: int = 0,
+        warmup: int = 0,
+        active: int | None = None,
+        skip_first: int = 0,
+    ) -> str:
         from torch.profiler import ProfilerActivity, profile
 
         json_file = f"{trace_path_template}_rank{rank}.json"
         os.makedirs(os.path.dirname(json_file) or ".", exist_ok=True)
         cls._backend = "cuda"
         cls._trace_path = f"{json_file}.gz"
+        cuda_active = 100000 if active is None else active
 
         logger.info("[Rank %s] Starting End-to-End Torch profiler (CUDA)", rank)
 
@@ -147,13 +212,12 @@ class TorchProfiler:
             except Exception as e:
                 logger.warning("[Rank %s] Failed to export trace: %s", rank, e)
 
+        schedule = _make_profiler_schedule(
+            torch.profiler, wait=wait, warmup=warmup, active=cuda_active, skip_first=skip_first
+        )
         cls._profiler = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(
-                wait=0,
-                warmup=0,
-                active=100000,
-            ),
+            schedule=schedule,
             on_trace_ready=trace_handler,
             record_shapes=True,
             profile_memory=True,

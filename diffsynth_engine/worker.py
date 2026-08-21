@@ -66,7 +66,14 @@ class Worker:
     def start_profile(self, **kwargs):
         path = kwargs.get("path", ".")
         profile_rank0_only = kwargs.get("profile_rank0_only", True)
-        return TorchProfiler.start(path, profile_rank0_only=profile_rank0_only)
+        return TorchProfiler.start(
+            path,
+            profile_rank0_only=profile_rank0_only,
+            wait=kwargs.get("wait", 0),
+            warmup=kwargs.get("warmup", 0),
+            active=kwargs.get("active"),
+            skip_first=kwargs.get("skip_first", 0),
+        )
 
     def stop_profile(self, **kwargs):
         result = TorchProfiler.stop()

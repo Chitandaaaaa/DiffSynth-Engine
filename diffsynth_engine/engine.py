@@ -38,7 +38,15 @@ class DiffSynthEngine:
     def shutdown(self):
         raise NotImplementedError
 
-    def start_profile(self, path: str = ".", profile_rank0_only: bool = True):
+    def start_profile(
+        self,
+        path: str = ".",
+        profile_rank0_only: bool = True,
+        wait: int = 0,
+        warmup: int = 0,
+        active: int | None = None,
+        skip_first: int = 0,
+    ):
         raise NotImplementedError
 
     def stop_profile(self):
@@ -211,8 +219,23 @@ class LocalEngine(DiffSynthEngine):
     def list_loras(self, lora_ids: str | list[str] | None = None) -> list[dict[str, Any]]:
         return self.pipeline.list_loras(lora_ids=lora_ids)
 
-    def start_profile(self, path: str = ".", profile_rank0_only: bool = True):
-        TorchProfiler.start(path, profile_rank0_only=profile_rank0_only)
+    def start_profile(
+        self,
+        path: str = ".",
+        profile_rank0_only: bool = True,
+        wait: int = 0,
+        warmup: int = 0,
+        active: int | None = None,
+        skip_first: int = 0,
+    ):
+        TorchProfiler.start(
+            path,
+            profile_rank0_only=profile_rank0_only,
+            wait=wait,
+            warmup=warmup,
+            active=active,
+            skip_first=skip_first,
+        )
 
     def stop_profile(self):
         return _collect_profile_results([TorchProfiler.stop()])
@@ -360,8 +383,25 @@ class DistributedEngine(DiffSynthEngine):
             self.workers = None
             self.conns = None
 
-    def start_profile(self, path: str = ".", profile_rank0_only: bool = True):
-        self._dispatch("start_profile", output_rank=0, path=path, profile_rank0_only=profile_rank0_only)
+    def start_profile(
+        self,
+        path: str = ".",
+        profile_rank0_only: bool = True,
+        wait: int = 0,
+        warmup: int = 0,
+        active: int | None = None,
+        skip_first: int = 0,
+    ):
+        self._dispatch(
+            "start_profile",
+            output_rank=0,
+            path=path,
+            profile_rank0_only=profile_rank0_only,
+            wait=wait,
+            warmup=warmup,
+            active=active,
+            skip_first=skip_first,
+        )
 
     def stop_profile(self):
         outputs = self._dispatch("stop_profile", output_rank=None)

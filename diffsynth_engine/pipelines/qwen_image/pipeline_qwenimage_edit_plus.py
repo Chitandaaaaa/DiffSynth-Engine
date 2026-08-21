@@ -30,6 +30,8 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwe
 from diffsynth_engine.configs.qwen_image import QwenImagePipelineConfig
 from diffsynth_engine.distributed.parallel_state import (
     get_cfg_group,
+    get_global_rank,
+    is_world_group_initialized,
     model_parallel_is_initialized,
 )
 from diffsynth_engine.forward_context import set_forward_context
@@ -38,6 +40,7 @@ from diffsynth_engine.pipelines.base import Pipeline
 from diffsynth_engine.pipelines.lora.pipeline_lora import LoRAPipeline
 from diffsynth_engine.registry import get_attn_backend
 from diffsynth_engine.utils import logging
+from diffsynth_engine.utils.torch_profiler import TorchProfiler
 
 logger = logging.get_logger(__name__)
 
@@ -743,6 +746,7 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
         where ``latents_len`` is derived from ``width`` x ``height`` (packed).
         Remaining tokens go to ``image_latents`` (and a short text stream).
         VAE encode/decode and the VL text encoder are skipped.
+        The denoise loop matches ``__call__``: no synchronize/barrier between steps.
         """
         if total_seq_len <= 0:
             raise ValueError(f"total_seq_len must be positive, got {total_seq_len}")
@@ -795,14 +799,17 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
         prompt_embeds = randn_tensor(
             (1, text_len, joint_attention_dim), generator=generator, device=device, dtype=dtype
         )
-        prompt_embeds_mask = torch.ones((1, text_len), dtype=torch.long, device=device)
+        # All mock tokens are valid. encode_prompt() already drops an all-ones mask;
+        # passing [B, S] into MindIE FA would be rejected (it wants [S, S], which is
+        # infeasible at 5e4/1e5: 50k^2 bool is ~2.5GB).
+        prompt_embeds_mask = None
 
         do_true_cfg = true_cfg_scale > 1
         if do_true_cfg:
             negative_prompt_embeds = randn_tensor(
                 (1, text_len, joint_attention_dim), generator=generator, device=device, dtype=dtype
             )
-            negative_prompt_embeds_mask = torch.ones((1, text_len), dtype=torch.long, device=device)
+            negative_prompt_embeds_mask = None
         else:
             negative_prompt_embeds = None
             negative_prompt_embeds_mask = None
@@ -852,6 +859,7 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
         self.scheduler.set_begin_index(0)
+        is_rank_zero = not is_world_group_initialized() or get_global_rank() == 0
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -880,6 +888,10 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
+
+                if is_rank_zero:
+                    logger.info("DiT mock step %d/%d", i + 1, num_inference_steps)
+                TorchProfiler.step()
 
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
