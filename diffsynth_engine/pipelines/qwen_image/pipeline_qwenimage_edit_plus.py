@@ -889,8 +889,6 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
 
-                if is_rank_zero:
-                    logger.info("DiT mock step %d/%d", i + 1, num_inference_steps)
                 TorchProfiler.step()
 
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

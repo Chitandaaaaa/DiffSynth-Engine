@@ -28,7 +28,6 @@ def _npu_experimental_config(torch_npu_mod):
     ExperimentalConfig = torch_npu_mod.profiler._ExperimentalConfig
     attempts = [
         dict(
-            export_type=torch_npu_mod.profiler.ExportType.Text,
             profiler_level=torch_npu_mod.profiler.ProfilerLevel.Level1,
             aic_metrics=torch_npu_mod.profiler.AiCMetrics.PipeUtilization,
             l2_cache=False,
@@ -72,6 +71,35 @@ def _make_profiler_schedule(profiler_mod, wait: int, warmup: int, active: int, s
     return None
 
 
+def _npu_trace_handler(torch_npu_mod, rank_dir: str, rank: int, analyse: bool):
+    """Dump to rank_dir. analyse=False keeps raw PROF_* for offline parse."""
+    handler = torch_npu_mod.profiler.tensorboard_trace_handler
+    attempts = [
+        dict(dir_name=rank_dir, worker_name=f"rank{rank}", analyse_flag=analyse),
+        dict(dir_name=rank_dir, worker_name=f"rank{rank}"),
+        dict(dir_name=rank_dir),
+        rank_dir,
+    ]
+    last_error = None
+    for kwargs in attempts:
+        try:
+            if isinstance(kwargs, str):
+                ready = handler(kwargs)
+            else:
+                ready = handler(**kwargs)
+            if isinstance(kwargs, dict) and "analyse_flag" not in kwargs and not analyse:
+                logger.warning(
+                    "[Rank %s] tensorboard_trace_handler has no analyse_flag; "
+                    "this torch_npu may still parse on stop",
+                    rank,
+                )
+            return ready
+        except TypeError as e:
+            last_error = e
+            continue
+    raise TypeError(f"tensorboard_trace_handler signature mismatch: {last_error}")
+
+
 class TorchProfiler:
     """
     End-to-end profiler.
@@ -95,6 +123,7 @@ class TorchProfiler:
         warmup: int = 0,
         active: int | None = None,
         skip_first: int = 0,
+        analyse: bool = False,
     ) -> str:
         if cls._profiler is not None:
             logger.warning("[Rank %s] Stopping existing profiler", cls._get_rank())
@@ -112,7 +141,13 @@ class TorchProfiler:
 
         if _use_npu_profiler():
             return cls._start_npu(
-                rank, trace_path_template, wait=wait, warmup=warmup, active=active, skip_first=skip_first
+                rank,
+                trace_path_template,
+                wait=wait,
+                warmup=warmup,
+                active=active,
+                skip_first=skip_first,
+                analyse=analyse,
             )
         return cls._start_cuda(
             rank, trace_path_template, wait=wait, warmup=warmup, active=active, skip_first=skip_first
@@ -127,6 +162,7 @@ class TorchProfiler:
         warmup: int = 0,
         active: int | None = None,
         skip_first: int = 0,
+        analyse: bool = False,
     ) -> str:
         import torch_npu
 
@@ -137,16 +173,13 @@ class TorchProfiler:
 
         experimental_config = _npu_experimental_config(torch_npu)
         logger.info(
-            "[Rank %s] Starting torch_npu profiler (CPU+NPU, Level1, PipeUtilization) -> %s",
+            "[Rank %s] Starting torch_npu profiler (CPU+NPU, Level1, PipeUtilization, analyse=%s) -> %s",
             rank,
+            analyse,
             rank_dir,
         )
 
-        handler_kwargs = {"dir_name": rank_dir, "worker_name": f"rank{rank}"}
-        try:
-            on_trace_ready = torch_npu.profiler.tensorboard_trace_handler(**handler_kwargs)
-        except TypeError:
-            on_trace_ready = torch_npu.profiler.tensorboard_trace_handler(rank_dir)
+        on_trace_ready = _npu_trace_handler(torch_npu, rank_dir, rank, analyse=analyse)
 
         profile_kwargs = dict(
             activities=[
@@ -255,9 +288,33 @@ class TorchProfiler:
         return {"trace": trace_path, "table": None}
 
     @classmethod
+    def analyse(cls, profiler_path: str):
+        """Offline parse of raw ``*_ascend_pt`` / ``PROF_*`` into kernel_details.csv."""
+        from torch_npu.profiler.profiler import analyse
+
+        logger.info("Analysing profiler data: %s", profiler_path)
+        analyse(os.path.abspath(profiler_path))
+
+    @classmethod
     def step(cls):
-        if cls._profiler is not None:
-            cls._profiler.step()
+        """Advance profiler schedule by one denoise step.
+
+        NPU kernels are async. Without a device drain here, ``schedule(wait, active)``
+        closes the host-side active window before kernels land, leaving empty
+        ``PROF_*/device_*/data`` and no ``trace_view.json``. This sync is only
+        taken when a profiler is running; production ``__call__`` never calls
+        ``TorchProfiler.step()``.
+        """
+        if cls._profiler is None:
+            return
+        if cls._backend == "npu":
+            try:
+                import torch_npu
+
+                torch_npu.npu.synchronize()
+            except Exception:
+                pass
+        cls._profiler.step()
 
     @classmethod
     def is_active(cls) -> bool:
