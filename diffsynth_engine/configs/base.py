@@ -23,6 +23,13 @@ class SpargeAttentionParams(AttentionParams):
 
 
 @dataclass
+class MindieBsaAttentionParams(AttentionParams):
+    sparsity: float = 0.6
+    inner_precise: int = 4
+    protect_first_frame: bool = False
+
+
+@dataclass
 class PipelineConfig:
     model_path: str
     model_dtype: torch.dtype = torch.bfloat16

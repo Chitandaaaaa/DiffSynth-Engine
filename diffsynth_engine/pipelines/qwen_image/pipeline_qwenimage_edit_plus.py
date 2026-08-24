@@ -35,6 +35,7 @@ from diffsynth_engine.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from diffsynth_engine.forward_context import set_forward_context
+from diffsynth_engine.layers.attention.bsa_utils import latent_shape_from_img_shapes, packed_hw
 from diffsynth_engine.models.qwen_image import AutoencoderKLQwenImage, QwenImageTransformer2DModel
 from diffsynth_engine.pipelines.base import Pipeline
 from diffsynth_engine.pipelines.lora.pipeline_lora import LoRAPipeline
@@ -606,15 +607,18 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
 
         return latents, image_latents
 
-    def _build_attn_metadata(self, attn_params):
-        if attn_params is None:
+    def _build_attn_metadata(self, attn_params, **extra):
+        params = {}
+        if attn_params is not None:
+            params.update(attn_params.to_dict())
+        params.update({k: v for k, v in extra.items() if v is not None})
+        if not params:
             return None
+        builder = self.attn_backend.get_builder_cls()()
+        return builder.build(**params)
 
-        builder_cls = self.attn_backend.get_builder_cls()
-        builder = builder_cls()
-        attn_params_dict = attn_params.to_dict()
-        attn_metadata = builder.build(**attn_params_dict)
-        return attn_metadata
+    def _use_bsa(self) -> bool:
+        return str(self.pipeline_config.attn_type) == "mindie_bsa"
 
     def _predict_noise_with_cfg(
         self,
@@ -860,6 +864,14 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
         self._num_timesteps = len(timesteps)
         self.scheduler.set_begin_index(0)
         is_rank_zero = not is_world_group_initialized() or get_global_rank() == 0
+        attn_metadata = self._build_attn_metadata(self.pipeline_config.attn_params)
+        if self._use_bsa():
+            latent_shape = latent_shape_from_img_shapes(img_shapes)
+            attn_metadata = self._build_attn_metadata(
+                self.pipeline_config.attn_params,
+                latent_shape=latent_shape,
+                txt_len=prompt_embeds.shape[1],
+            )
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -868,7 +880,6 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
 
                 self._current_timestep = t
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
-                attn_metadata = self._build_attn_metadata(self.pipeline_config.attn_params)
                 noise_pred = self._predict_noise_with_cfg(
                     latents=latents,
                     image_latents=image_latents,
@@ -1069,7 +1080,10 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
                 condition_width, condition_height = calculate_dimensions(
                     CONDITION_IMAGE_SIZE, image_width / image_height
                 )
-                vae_width, vae_height = calculate_dimensions(VAE_IMAGE_SIZE, image_width / image_height)
+                if self._use_bsa():
+                    vae_width, vae_height = width, height
+                else:
+                    vae_width, vae_height = calculate_dimensions(VAE_IMAGE_SIZE, image_width / image_height)
                 condition_images.append(self.image_processor.resize(img, condition_height, condition_width))
                 vae_images.append(self.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
                 vae_image_sizes.append((vae_width, vae_height))
@@ -1131,6 +1145,20 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
                 ],
             ]
         ] * batch_size
+        if self._use_bsa() and vae_image_sizes:
+            packed_h, packed_w = packed_hw(height, width, self.vae_scale_factor)
+            n_ref = len(vae_image_sizes)
+            img_shapes = [[(1, packed_h, packed_w)] * (1 + n_ref)] * batch_size
+            grid = packed_h * packed_w
+            if latents.shape[1] != grid:
+                raise ValueError(
+                    f"BSA packed target seq {latents.shape[1]} != H*W={grid} for {width}x{height}"
+                )
+            if image_latents is not None and image_latents.shape[1] != n_ref * grid:
+                raise ValueError(
+                    f"BSA packed ref seq {image_latents.shape[1]} != {n_ref}*{grid}; "
+                    "refs were resized to the generation canvas so every segment shares H×W"
+                )
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
@@ -1155,6 +1183,20 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
         if self.attention_kwargs is None:
             self._attention_kwargs = {}
 
+        attn_metadata = self._build_attn_metadata(self.pipeline_config.attn_params)
+        if self._use_bsa():
+            latent_shape = latent_shape_from_img_shapes(img_shapes)
+            attn_metadata = self._build_attn_metadata(
+                self.pipeline_config.attn_params,
+                latent_shape=latent_shape,
+                txt_len=prompt_embeds.shape[1],
+            )
+            logger.info(
+                "MindIE BSA Edit Plus: latent_shape=%s (t=1+N_ref) txt_len=%d",
+                latent_shape,
+                prompt_embeds.shape[1],
+            )
+
         # 6. Denoising loop
         self.scheduler.set_begin_index(0)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1165,8 +1207,6 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
                 self._current_timestep = t
 
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
-                attn_metadata = self._build_attn_metadata(self.pipeline_config.attn_params)
 
                 noise_pred = self._predict_noise_with_cfg(
                     latents=latents,

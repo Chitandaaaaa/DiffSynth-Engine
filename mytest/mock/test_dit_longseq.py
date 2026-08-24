@@ -19,6 +19,7 @@ NPU profile（schedule，只采某几步）:
       --profile-start-step 2 --profile-num-steps 1 --profile-ranks rank0
 
   python  --parallelism 8 --sp-ulysses-degree 4  --use-cfg-parallel  --total-seq-len 50000    --profile  --profile-start-step 0 --profile-num-steps 1
+  python test_dit_longseq.py  --parallelism 4 --sp-ulysses-degree 4  --true-cfg-scale 1.0  --total-seq-len 250000  --num-inference-steps 2  --profile  --profile-start-step 1 --profile-num-steps 1  --profile-ranks all   --warmup-steps 1
 """
 
 import argparse
