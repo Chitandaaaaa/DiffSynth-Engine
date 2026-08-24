@@ -1199,6 +1199,8 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
 
         # 6. Denoising loop
         self.scheduler.set_begin_index(0)
+        # Close encode/VAE as profiler step 0 so schedule wait/active maps onto DiT steps.
+        TorchProfiler.step()
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -1238,6 +1240,8 @@ class QwenImageEditPlusPipeline(LoRAPipeline, Pipeline):
 
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+                TorchProfiler.step()
 
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()

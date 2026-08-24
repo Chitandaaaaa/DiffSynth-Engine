@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
-import importlib
 from dataclasses import dataclass
-from typing import Any, Callable
 
 import torch
 
@@ -27,27 +25,11 @@ from diffsynth_engine.utils import logging
 
 logger = logging.get_logger(__name__)
 
-_BSA_IMPORTS = (
-    ("mindiesd.layers.flash_attn.attention_forward", "bsa_sparse_attention_v3"),
-    ("mindiesd.layers.flash_attn.bsa_sparse_attention", "bsa_sparse_attention_v3"),
-    ("mindiesd.layers.sparse_attention", "bsa_sparse_attention_v3"),
-    ("mindiesd", "bsa_sparse_attention_v3"),
-)
 
+def _load_bsa_fn():
+    from mindiesd.layers.flash_attn.sparse_flash_attn_rf_v3 import bsa_sparse_attention_v3
 
-def _load_bsa_fn() -> Callable[..., Any]:
-    errors: list[str] = []
-    for module_name, attr in _BSA_IMPORTS:
-        try:
-            module = importlib.import_module(module_name)
-            fn = getattr(module, attr)
-            if callable(fn):
-                return fn
-        except (ImportError, AttributeError) as e:
-            errors.append(f"{module_name}.{attr}: {e}")
-    raise ImportError(
-        "bsa_sparse_attention_v3 not found in MindIE-SD. Tried:\n  " + "\n  ".join(errors)
-    )
+    return bsa_sparse_attention_v3
 
 
 @dataclass
@@ -162,20 +144,31 @@ class MindieBsaAttentionImpl(AttentionImpl):
             )
         t, h, w = attn_metadata.latent_shape
         image_len = int(t) * int(h) * int(w)
-        txt_len = int(attn_metadata.txt_len)
         sp_size = get_ulysses_parallel_world_size() if is_sp_group_initialized() else 1
-        txt_pad, img_pad = padded_txt_image_len(txt_len, image_len, sp_size)
-        if query.shape[1] != txt_pad + img_pad:
+        _, img_pad = padded_txt_image_len(0, image_len, sp_size)
+        if query.shape[1] < img_pad:
             raise ValueError(
-                f"BSA seq mismatch: q_seq={query.shape[1]} != txt_len={txt_pad} + t*H*W={img_pad} "
-                f"(latent_shape={attn_metadata.latent_shape}, sp={sp_size})"
+                f"BSA seq shorter than image grid: q_seq={query.shape[1]} < t*H*W={img_pad} "
+                f"(latent_shape={attn_metadata.latent_shape})"
             )
+        # Infer text length from this forward. CFG pos/neg prompts often differ
+        # (e.g. 221 vs 209); do not reuse pipeline txt_len from the positive branch.
+        txt_pad = query.shape[1] - img_pad
+        if sp_size > 1 and txt_pad % sp_size != 0:
+            raise ValueError(
+                f"BSA txt_len={txt_pad} is not divisible by ulysses sp={sp_size} "
+                f"(q_seq={query.shape[1]}, t*H*W={img_pad})"
+            )
+        attn_metadata.txt_len = txt_pad
 
         q = interleaved_to_txt_img(query, txt_pad, img_pad, sp_size)
         k = interleaved_to_txt_img(key, txt_pad, img_pad, sp_size)
         v = interleaved_to_txt_img(value, txt_pad, img_pad, sp_size)
 
-        out, new_mask = self._bsa()(
+        # Do not reuse cached_mask across the 60 DiT layers or CFG pos/neg:
+        # metadata is shared, so layer0's mask would be applied to layer1..59.
+        # The kernel's mask is Q-dependent; a dense-FA SSIM check needs a fresh mask.
+        out, _new_mask = self._bsa()(
             q,
             k,
             v,
@@ -188,8 +181,7 @@ class MindieBsaAttentionImpl(AttentionImpl):
             num_key_value_heads=k.shape[2],
             scale=self.softmax_scale,
             inner_precise=attn_metadata.inner_precise,
-            cached_mask=attn_metadata.cached_mask,
+            cached_mask=None,
             protect_first_frame=attn_metadata.protect_first_frame,
         )
-        attn_metadata.cached_mask = new_mask
         return txt_img_to_interleaved(out, txt_pad, img_pad, sp_size)

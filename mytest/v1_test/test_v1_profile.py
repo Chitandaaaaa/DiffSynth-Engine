@@ -2,9 +2,17 @@
 4 卡 Ulysses SPx4 图生图推理 + NPU profile — Qwen-Image-Edit-2511
 
 基于 test_v1.py，新增命令行配置的 NPU profiling：
-  - --profile            开启 profiling（默认关闭，关闭时行为与 test_v1.py 一致）
-  - --profile-dir        输出根目录（默认 ./msprof_output_<timestamp>）
-  - --profile-ranks      all=每张卡各出一份 / rank0=仅第 0 卡（默认 all）
+  - --profile              开启 profiling（默认关闭，关闭时行为与 test_v1.py 一致）
+  - --profile-dir          输出根目录（默认 ./msprof_output_<timestamp>）
+  - --profile-ranks        all=每张卡各出一份 / rank0=仅第 0 卡（默认 all）
+  - --profile-start-step   从第几个 DiT step 开始采集（0-based，对应 schedule wait）
+  - --profile-num-steps    连续采集几个 DiT step（对应 schedule active，默认 1）
+
+NPU profile（schedule，只采某几步 DiT）:
+  warmup 不开；正式 generate 开启。
+  skip_first=1 把 VL/VAE encode 从 DiT 窗口里剥出去；
+  wait=--profile-start-step, warmup=0, active=--profile-num-steps。
+  VAE decode 落在 active 结束之后，不会进 trace。
 
 多卡时通过 engine.start_profile(profile_rank0_only=False) 让每个 worker（每张卡）
 各自用 torch_npu.profiler（CPU+NPU）采集，stop_profile 从所有 worker 收集并打印每卡 trace。
@@ -13,11 +21,13 @@
   export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
   # 只计时（不开 profile）
   python test_v1_profile.py --case-index 2
-  # 4 卡每卡各一份 NPU profile
+  # 只采第 0 个 DiT step（4 卡每卡各一份）
   python test_v1_profile.py --case-index 2 --profile
-  # 指定输出目录 + 只采 rank0
-  python test_v1_profile.py --case-index 2 --profile \
-      --profile-dir ./prof --profile-ranks rank0
+  # 从第 2 个 DiT step 起采 1 步，只采 rank0
+  python test_v1_profile.py --case-index 2 --profile \\
+      --profile-start-step 2 --profile-num-steps 1 --profile-ranks rank0
+  # 指定输出目录
+  python test_v1_profile.py --case-index 2 --profile --profile-dir ./prof
 """
 
 import argparse
@@ -75,12 +85,36 @@ def parse_args():
     parser.add_argument("--use-torch-compile", action="store_true", default=False)
     parser.add_argument("--use-fsdp", action="store_true", default=False)
     # ── Profiling 配置 ──
-    parser.add_argument("--profile", action="store_true", default=False,
-                        help="开启 NPU profiling（torch_npu.profiler，多卡时每卡各一份）")
-    parser.add_argument("--profile-dir", type=str, default=None,
-                        help="Profile 输出根目录（默认 ./msprof_output_<timestamp>）")
-    parser.add_argument("--profile-ranks", choices=["all", "rank0"], default="all",
-                        help="采集哪些卡的 profile：all=每张卡 / rank0=仅第 0 卡（默认 all）")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help="开启 NPU profiling（schedule 只采指定 DiT step，多卡时每卡各一份）",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default=None,
+        help="Profile 输出根目录（默认 ./msprof_output_<timestamp>）",
+    )
+    parser.add_argument(
+        "--profile-ranks",
+        choices=["all", "rank0"],
+        default="all",
+        help="采集哪些卡的 profile：all=每张卡 / rank0=仅第 0 卡（默认 all）",
+    )
+    parser.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=0,
+        help="从第几个 DiT step 开始采集（0-based，对应 schedule wait）",
+    )
+    parser.add_argument(
+        "--profile-num-steps",
+        type=int,
+        default=1,
+        help="连续采集几个 DiT step（对应 schedule active，默认 1）",
+    )
     return parser.parse_args()
 
 
@@ -100,6 +134,15 @@ def main():
         raise SystemExit(f"--warmup-steps must be >= 0, got {args.warmup_steps}")
     if args.num_inference_steps < 1:
         raise SystemExit(f"--num-inference-steps must be >= 1, got {args.num_inference_steps}")
+    if args.profile_start_step < 0:
+        raise SystemExit(f"--profile-start-step must be >= 0, got {args.profile_start_step}")
+    if args.profile_num_steps < 1:
+        raise SystemExit(f"--profile-num-steps must be >= 1, got {args.profile_num_steps}")
+    if args.profile_start_step + args.profile_num_steps > args.num_inference_steps:
+        raise SystemExit(
+            f"--profile-start-step ({args.profile_start_step}) + --profile-num-steps "
+            f"({args.profile_num_steps}) exceeds --num-inference-steps ({args.num_inference_steps})"
+        )
 
     from diffsynth_engine import DiffSynthEngine
     from diffsynth_engine.configs import QwenImagePipelineConfig
@@ -128,7 +171,13 @@ def main():
     logger.info("case-index: %d", args.case_index)
     logger.info("输出目录: %s", output_root)
     if args.profile:
-        logger.info("Profile: dir=%s, ranks=%s", profile_dir, args.profile_ranks)
+        logger.info(
+            "Profile: dir=%s ranks=%s wait=%d active=%d skip_first=1 (DiT steps only)",
+            profile_dir,
+            args.profile_ranks,
+            args.profile_start_step,
+            args.profile_num_steps,
+        )
 
     # 与 0807 main 脚本 config 数值一致；v1 用整仓 model_path，pipeline 由 model_index 自动识别。
     # use_zero_cond_t 不在 v1 PipelineConfig 中，2511 的 zero_cond_t 由模型 config 决定。
@@ -169,10 +218,22 @@ def main():
 
         logger.info("=== Case %d (images=%d, %dx%d) ===", args.case_index, len(image_names), width, height)
 
-        # 正式推理前开启 profile（只覆盖正式推理，不含 warmup）
+        # 正式推理前开启 profile（只覆盖正式推理的指定 DiT step，不含 warmup）
         if args.profile:
-            engine.start_profile(profile_dir, profile_rank0_only=profile_rank0_only)
-            logger.info("Profiling 已开启（rank0_only=%s），覆盖正式推理", profile_rank0_only)
+            engine.start_profile(
+                profile_dir,
+                profile_rank0_only=profile_rank0_only,
+                wait=args.profile_start_step,
+                warmup=0,
+                active=args.profile_num_steps,
+                skip_first=1,
+            )
+            logger.info(
+                "Profiling 已开启: wait=%d active=%d skip_first=1 rank0_only=%s",
+                args.profile_start_step,
+                args.profile_num_steps,
+                profile_rank0_only,
+            )
 
         t0 = time.perf_counter_ns()
         result = engine.generate(
