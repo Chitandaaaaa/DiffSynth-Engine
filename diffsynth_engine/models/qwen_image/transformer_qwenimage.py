@@ -84,31 +84,27 @@ def apply_rotary_emb_qwen(
 
         return out
     else:
-        if current_platform.op_fusion and is_mindie_sd_available() and x.device.type == "npu":
-            from mindiesd import rotary_position_embedding
+        if current_platform.op_fusion and x.device.type == "npu":
+            import torch_npu
 
             # Cache expanded cos/sin on the tensor object itself.
             # Python object identity avoids data_ptr collision across different-length slices.
+            # Cast cos/sin to x.dtype here (not via mindiesd.rotary_position_embedding), so
+            # npu_rotary_mul sees matching dtypes and profiling has no Cast around RoPE.
             cached = getattr(freqs_cis, "_rope_expanded", None)
-            if cached is None:
+            if cached is None or cached[0].dtype != x.dtype or cached[0].device != x.device:
                 cos = freqs_cis.real  # (s, d/2)
                 sin = freqs_cis.imag
                 cos = cos.reshape(1, -1, 1, cos.shape[-1])  # (1, S, 1, D/2)
                 sin = sin.reshape(1, -1, 1, sin.shape[-1])
                 cos = cos.unsqueeze(-1).expand(-1, -1, -1, -1, 2).flatten(start_dim=-2)  # (1, S, 1, D)
                 sin = sin.unsqueeze(-1).expand(-1, -1, -1, -1, 2).flatten(start_dim=-2)
-                cos, sin = cos.to(x.device), sin.to(x.device)
+                cos = cos.to(device=x.device, dtype=x.dtype)
+                sin = sin.to(device=x.device, dtype=x.dtype)
                 cached = (cos, sin)
                 freqs_cis._rope_expanded = cached
             cos, sin = cached
-            return rotary_position_embedding(
-                x,
-                cos,
-                sin,
-                rotated_mode="rotated_interleaved",
-                head_first=False,
-                fused=True,
-            )
+            return torch_npu.npu_rotary_mul(x, cos, sin, "interleave")
 
         x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
         freqs_cis = freqs_cis.unsqueeze(1)
